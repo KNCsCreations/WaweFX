@@ -1,0 +1,35 @@
+pub mod audio;
+pub mod config;
+pub mod sync;
+pub mod ui;
+
+use std::sync::Arc;
+
+use eframe::egui;
+
+fn main() -> eframe::Result {
+    let cfg = config::AppConfig::load_or_default();
+    let audio_engine = audio::AudioEngine::new(&cfg.audio);
+    let sync_handle = sync::SyncServerHandle::start(&cfg, audio_engine.clone());
+
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("WaweFX")
+            .with_inner_size([800.0, 450.0])
+            .with_min_inner_size([660.0, 360.0])
+            .with_icon(Arc::new(ui::build_window_icon())),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "WaweFX",
+        native_options,
+        Box::new(move |_cc| {
+            Ok(Box::new(ui::WaweFxApp::new(
+                cfg,
+                audio_engine,
+                sync_handle,
+            )))
+        }),
+    )
+}

@@ -1,0 +1,81 @@
+name: Build WaweFX
+
+on:
+  push:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: WaweFX-Windows
+          path: target/release/WaweFX.exe
+
+  build-macos:
+    name: macOS (Universal .app)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (Apple Silicon + Intel)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check compilation without warnings
+        run: RUSTFLAGS="-D warnings" cargo check --all-targets --locked
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+      - name: Build Apple Silicon release binary
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Build Intel release binary
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Assemble Universal WaweFX.app bundle
+        shell: bash
+        run: |
+          mkdir -p WaweFX.app/Contents/MacOS
+          lipo -create \
+            target/aarch64-apple-darwin/release/WaweFX \
+            target/x86_64-apple-darwin/release/WaweFX \
+            -output WaweFX.app/Contents/MacOS/WaweFX
+          chmod +x WaweFX.app/Contents/MacOS/WaweFX
+          cp macos/Info.plist WaweFX.app/Contents/Info.plist
+          printf "APPL????" > WaweFX.app/Contents/PkgInfo
+          codesign --force --deep --sign - WaweFX.app
+          ditto -c -k --sequesterRsrc --keepParent WaweFX.app WaweFX-macOS.zip
+
+      - name: Upload macOS app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: WaweFX-macOS
+          path: WaweFX-macOS.zip

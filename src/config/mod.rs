@@ -1,0 +1,436 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use eframe::egui::Color32;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Persistent JSON configuration file name stored alongside the working directory.
+pub const CONFIG_FILE_NAME: &str = "wawefx_config.json";
+
+/// Uniform internal audio mixer sample rate (Hz) used across normalized sound buffers.
+pub const TARGET_SAMPLE_RATE: u32 = 48_000;
+
+/// Uniform internal audio mixer channel count (stereo).
+pub const TARGET_CHANNELS: u16 = 2;
+
+/// Minimum and maximum supported playback speed/pitch factor.
+pub const MIN_PLAYBACK_SPEED: f32 = 0.5;
+pub const MAX_PLAYBACK_SPEED: f32 = 2.0;
+
+/// Minimum and maximum supported stream volume gain (0% to 200%).
+pub const MIN_STREAM_VOLUME: f32 = 0.0;
+pub const MAX_STREAM_VOLUME: f32 = 2.0;
+
+/// Represents a single sound pad entry on the WaweFX soundboard.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SoundItem {
+    pub id: String,
+    pub title: String,
+    pub audio_path: PathBuf,
+    pub image_path: Option<PathBuf>,
+    pub duration_secs: f32,
+    pub volume_trim: f32,
+}
+
+impl Default for SoundItem {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            title: "Untitled Sound".to_string(),
+            audio_path: PathBuf::new(),
+            image_path: None,
+            duration_secs: 0.0,
+            volume_trim: 1.0,
+        }
+    }
+}
+
+impl SoundItem {
+    /// Creates a new [`SoundItem`] with a freshly generated UUID v4 identifier.
+    pub fn new(
+        title: impl Into<String>,
+        audio_path: PathBuf,
+        image_path: Option<PathBuf>,
+        duration_secs: f32,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            title: title.into(),
+            audio_path,
+            image_path,
+            duration_secs: duration_secs.max(0.0),
+            volume_trim: 1.0,
+        }
+    }
+
+    /// Formats the sound duration as `MM:SS` for display on pad cards and mobile clients.
+    pub fn formatted_duration(&self) -> String {
+        let total_secs = self.duration_secs.max(0.0).round() as u32;
+        let minutes = total_secs / 60;
+        let seconds = total_secs % 60;
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+/// Persistent audio device selection, routing toggles, and gain/pitch states.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AudioRoutingConfig {
+    pub physical_mic_device: Option<String>,
+    pub virtual_mic_output_device: Option<String>,
+    pub headphones_output_device: Option<String>,
+    pub mic_passthrough_enabled: bool,
+    pub mic_stream_enabled: bool,
+    pub mic_volume: f32,
+    pub headphones_stream_enabled: bool,
+    pub headphones_volume: f32,
+    pub playback_speed: f32,
+    pub sync_port: u16,
+}
+
+impl Default for AudioRoutingConfig {
+    fn default() -> Self {
+        Self {
+            physical_mic_device: None,
+            virtual_mic_output_device: None,
+            headphones_output_device: None,
+            mic_passthrough_enabled: true,
+            mic_stream_enabled: true,
+            mic_volume: 1.0,
+            headphones_stream_enabled: true,
+            headphones_volume: 1.0,
+            playback_speed: 1.0,
+            sync_port: 8765,
+        }
+    }
+}
+
+/// Available color theme presets in Settings, plus `Custom` when RGB values are edited manually.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ThemePreset {
+    #[default]
+    ClassicLilac,
+    MidnightDark,
+    NordFrost,
+    Custom,
+}
+
+impl ThemePreset {
+    /// The 3 built-in presets displayed in the Settings theme selector.
+    pub const BUILTIN_PRESETS: [ThemePreset; 3] = [
+        ThemePreset::ClassicLilac,
+        ThemePreset::MidnightDark,
+        ThemePreset::NordFrost,
+    ];
+
+    /// Human-readable display label for the Settings UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemePreset::ClassicLilac => "Classic WaweFX Lilac",
+            ThemePreset::MidnightDark => "Midnight Dark",
+            ThemePreset::NordFrost => "Nord Frost",
+            ThemePreset::Custom => "Custom",
+        }
+    }
+}
+
+/// Full customizable color palette for the WaweFX toolbar, canvas, and soundboard grid.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub preset: ThemePreset,
+    pub bg_main: [u8; 3],
+    pub bg_toolbar: [u8; 3],
+    pub toolbar_divider: [u8; 3],
+    pub toolbar_shadow: [u8; 3],
+    pub icon_primary: [u8; 3],
+    pub icon_secondary: [u8; 3],
+    pub icon_phone: [u8; 3],
+    pub gauge_and_track: [u8; 3],
+    pub accent_color: [u8; 3],
+    pub pad_card_bg: [u8; 3],
+    pub pad_card_hover: [u8; 3],
+    pub pad_text: [u8; 3],
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self::classic_lilac()
+    }
+}
+
+impl ThemeConfig {
+    /// Exact default palette matching the reference WaweFX UI screenshot (`#D8BFD8`, `#4A5568`, `#708090`, `#FF7F50`).
+    pub fn classic_lilac() -> Self {
+        Self {
+            preset: ThemePreset::ClassicLilac,
+            bg_main: [0xD8, 0xBF, 0xD8],
+            bg_toolbar: [0xD8, 0xBF, 0xD8],
+            toolbar_divider: [0x00, 0x00, 0x00],
+            toolbar_shadow: [0x64, 0x64, 0x64],
+            icon_primary: [0x4A, 0x55, 0x68],
+            icon_secondary: [0x3E, 0x46, 0x56],
+            icon_phone: [0x37, 0x41, 0x51],
+            gauge_and_track: [0x70, 0x80, 0x90],
+            accent_color: [0xFF, 0x7F, 0x50],
+            pad_card_bg: [0xC8, 0xAD, 0xC8],
+            pad_card_hover: [0xBF, 0xA0, 0xBF],
+            pad_text: [0x2D, 0x37, 0x48],
+        }
+    }
+
+    /// Deep dark studio palette with crisp slate surfaces and sky-blue accents.
+    pub fn midnight_dark() -> Self {
+        Self {
+            preset: ThemePreset::MidnightDark,
+            bg_main: [0x18, 0x1B, 0x22],
+            bg_toolbar: [0x20, 0x24, 0x2E],
+            toolbar_divider: [0x0F, 0x11, 0x17],
+            toolbar_shadow: [0x2D, 0x33, 0x42],
+            icon_primary: [0xCB, 0xD5, 0xE1],
+            icon_secondary: [0x94, 0xA3, 0xB8],
+            icon_phone: [0xE2, 0xE8, 0xF0],
+            gauge_and_track: [0x64, 0x74, 0x8B],
+            accent_color: [0x38, 0xBD, 0xF8],
+            pad_card_bg: [0x24, 0x29, 0x36],
+            pad_card_hover: [0x2E, 0x34, 0x45],
+            pad_text: [0xF1, 0xF5, 0xF9],
+        }
+    }
+
+    /// Arctic Nord palette with polar night backgrounds and frost cyan accents.
+    pub fn nord_frost() -> Self {
+        Self {
+            preset: ThemePreset::NordFrost,
+            bg_main: [0x2E, 0x34, 0x40],
+            bg_toolbar: [0x3B, 0x42, 0x52],
+            toolbar_divider: [0x24, 0x29, 0x33],
+            toolbar_shadow: [0x4C, 0x56, 0x6A],
+            icon_primary: [0xD8, 0xDE, 0xE9],
+            icon_secondary: [0xE5, 0xE9, 0xF0],
+            icon_phone: [0xEC, 0xEF, 0xF4],
+            gauge_and_track: [0x81, 0xA1, 0xC1],
+            accent_color: [0x88, 0xC0, 0xD0],
+            pad_card_bg: [0x3B, 0x42, 0x52],
+            pad_card_hover: [0x43, 0x4C, 0x5E],
+            pad_text: [0xEC, 0xEF, 0xF4],
+        }
+    }
+
+    /// Constructs a [`ThemeConfig`] from a [`ThemePreset`].
+    pub fn from_preset(preset: ThemePreset) -> Self {
+        match preset {
+            ThemePreset::ClassicLilac => Self::classic_lilac(),
+            ThemePreset::MidnightDark => Self::midnight_dark(),
+            ThemePreset::NordFrost => Self::nord_frost(),
+            ThemePreset::Custom => {
+                let mut custom = Self::classic_lilac();
+                custom.preset = ThemePreset::Custom;
+                custom
+            }
+        }
+    }
+
+    /// Applies one of the built-in presets, replacing all color slots.
+    pub fn apply_preset(&mut self, preset: ThemePreset) {
+        if preset == ThemePreset::Custom {
+            self.preset = ThemePreset::Custom;
+            return;
+        }
+        *self = Self::from_preset(preset);
+    }
+
+    /// Switches `preset` to [`ThemePreset::Custom`] if the current colors no longer match the active preset.
+    pub fn mark_custom_if_changed(&mut self) {
+        if self.preset == ThemePreset::Custom {
+            return;
+        }
+        let baseline = Self::from_preset(self.preset);
+        if !self.colors_equal(&baseline) {
+            self.preset = ThemePreset::Custom;
+        }
+    }
+
+    fn colors_equal(&self, other: &Self) -> bool {
+        self.bg_main == other.bg_main
+            && self.bg_toolbar == other.bg_toolbar
+            && self.toolbar_divider == other.toolbar_divider
+            && self.toolbar_shadow == other.toolbar_shadow
+            && self.icon_primary == other.icon_primary
+            && self.icon_secondary == other.icon_secondary
+            && self.icon_phone == other.icon_phone
+            && self.gauge_and_track == other.gauge_and_track
+            && self.accent_color == other.accent_color
+            && self.pad_card_bg == other.pad_card_bg
+            && self.pad_card_hover == other.pad_card_hover
+            && self.pad_text == other.pad_text
+    }
+}
+
+/// Converts an `[R, G, B]` array to `egui::Color32`.
+pub fn rgb_to_color32(rgb: [u8; 3]) -> Color32 {
+    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+}
+
+/// Root persistent application configuration serialized to `wawefx_config.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AppConfig {
+    pub sounds: Vec<SoundItem>,
+    pub selected_sound_id: Option<String>,
+    pub audio: AudioRoutingConfig,
+    pub theme: ThemeConfig,
+}
+
+impl AppConfig {
+    /// Returns the default configuration file path (`wawefx_config.json` in the current directory).
+    pub fn config_path() -> PathBuf {
+        PathBuf::from(CONFIG_FILE_NAME)
+    }
+
+    /// Loads configuration from `wawefx_config.json`, falling back to defaults when missing or unreadable.
+    pub fn load_or_default() -> Self {
+        let path = Self::config_path();
+        if !path.exists() {
+            return Self::default();
+        }
+        Self::load_from_path(&path).unwrap_or_else(|err| {
+            tracing::warn!("Failed to load config from {}: {err:#}. Using defaults.", path.display());
+            Self::default()
+        })
+    }
+
+    /// Loads and validates configuration from an explicit file path.
+    pub fn load_from_path(path: &Path) -> anyhow::Result<Self> {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        let mut config: Self = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse JSON config from {}", path.display()))?;
+        config.sanitize();
+        Ok(config)
+    }
+
+    /// Saves configuration to the default `wawefx_config.json` path.
+    pub fn save(&self) -> anyhow::Result<()> {
+        self.save_to_path(&Self::config_path())
+    }
+
+    /// Atomically serializes and writes configuration to the provided file path.
+    pub fn save_to_path(&self, path: &Path) -> anyhow::Result<()> {
+        let mut sanitized = self.clone();
+        sanitized.sanitize();
+
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create config parent directory {}", parent.display())
+            })?;
+        }
+
+        let json = serde_json::to_string_pretty(&sanitized)
+            .context("failed to serialize AppConfig to JSON")?;
+        fs::write(path, json)
+            .with_context(|| format!("failed to write config file {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Clamps numeric fields to safe runtime bounds and normalizes selection.
+    pub fn sanitize(&mut self) {
+        self.audio.mic_volume = self.audio.mic_volume.clamp(MIN_STREAM_VOLUME, MAX_STREAM_VOLUME);
+        self.audio.headphones_volume = self
+            .audio
+            .headphones_volume
+            .clamp(MIN_STREAM_VOLUME, MAX_STREAM_VOLUME);
+        self.audio.playback_speed = self
+            .audio
+            .playback_speed
+            .clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED);
+        if self.audio.sync_port == 0 {
+            self.audio.sync_port = 8765;
+        }
+        for sound in &mut self.sounds {
+            sound.duration_secs = sound.duration_secs.max(0.0);
+            sound.volume_trim = sound.volume_trim.clamp(0.0, 2.0);
+        }
+        if let Some(selected) = &self.selected_sound_id
+            && !self.sounds.iter().any(|s| &s.id == selected)
+        {
+            self.selected_sound_id = self.sounds.first().map(|s| s.id.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_theme_matches_reference_screenshot_colors() {
+        let theme = ThemeConfig::default();
+        assert_eq!(theme.preset, ThemePreset::ClassicLilac);
+        assert_eq!(theme.bg_main, [0xD8, 0xBF, 0xD8]);
+        assert_eq!(theme.bg_toolbar, [0xD8, 0xBF, 0xD8]);
+        assert_eq!(theme.toolbar_divider, [0x00, 0x00, 0x00]);
+        assert_eq!(theme.icon_primary, [0x4A, 0x55, 0x68]);
+        assert_eq!(theme.gauge_and_track, [0x70, 0x80, 0x90]);
+        assert_eq!(theme.accent_color, [0xFF, 0x7F, 0x50]);
+        assert_eq!(
+            rgb_to_color32(theme.accent_color),
+            Color32::from_rgb(0xFF, 0x7F, 0x50)
+        );
+    }
+
+    #[test]
+    fn builtin_presets_switch_and_track_custom_edits() {
+        assert_eq!(ThemePreset::BUILTIN_PRESETS.len(), 3);
+
+        let mut theme = ThemeConfig::default();
+        theme.apply_preset(ThemePreset::MidnightDark);
+        assert_eq!(theme.preset, ThemePreset::MidnightDark);
+        assert_eq!(theme.bg_main, [0x18, 0x1B, 0x22]);
+
+        theme.apply_preset(ThemePreset::NordFrost);
+        assert_eq!(theme.preset, ThemePreset::NordFrost);
+        assert_eq!(theme.bg_main, [0x2E, 0x34, 0x40]);
+
+        theme.bg_main = [0x11, 0x22, 0x33];
+        theme.mark_custom_if_changed();
+        assert_eq!(theme.preset, ThemePreset::Custom);
+    }
+
+    #[test]
+    fn config_json_roundtrip_and_sanitization() {
+        let mut cfg = AppConfig::default();
+        cfg.audio.playback_speed = 9.0;
+        cfg.audio.mic_volume = -1.0;
+        cfg.audio.headphones_volume = 3.5;
+
+        let sound = SoundItem::new(
+            "Airhorn",
+            PathBuf::from("sounds/airhorn.wav"),
+            Some(PathBuf::from("images/airhorn.png")),
+            12.4,
+        );
+        let id = sound.id.clone();
+        assert_eq!(sound.formatted_duration(), "00:12");
+        cfg.sounds.push(sound);
+        cfg.selected_sound_id = Some(id.clone());
+
+        let temp_path = std::env::temp_dir().join(format!("wawefx_test_{}.json", Uuid::new_v4()));
+        cfg.save_to_path(&temp_path).expect("save test config");
+
+        let loaded = AppConfig::load_from_path(&temp_path).expect("load test config");
+        let _ = fs::remove_file(&temp_path);
+
+        assert_eq!(loaded.audio.playback_speed, MAX_PLAYBACK_SPEED);
+        assert_eq!(loaded.audio.mic_volume, MIN_STREAM_VOLUME);
+        assert_eq!(loaded.audio.headphones_volume, MAX_STREAM_VOLUME);
+        assert_eq!(loaded.selected_sound_id.as_deref(), Some(id.as_str()));
+        assert_eq!(loaded.sounds.len(), 1);
+        assert_eq!(loaded.sounds[0].title, "Airhorn");
+    }
+}
