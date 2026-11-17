@@ -11,9 +11,10 @@ jobs:
   build-windows:
     name: Windows (x86_64)
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -28,7 +29,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Upload Windows executable
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: WaweFX-Windows
           path: target/release/WaweFX.exe
@@ -36,9 +37,10 @@ jobs:
   build-macos:
     name: macOS (Universal .dmg)
     runs-on: macos-latest
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain (Apple Silicon + Intel)
         uses: dtolnay/rust-toolchain@stable
@@ -79,7 +81,7 @@ jobs:
           hdiutil create -volname "WaweFX" -srcfolder dmg_root -ov -format UDZO WaweFX-macOS.dmg
 
       - name: Upload macOS DMG installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: WaweFX-macOS
           path: WaweFX-macOS.dmg
