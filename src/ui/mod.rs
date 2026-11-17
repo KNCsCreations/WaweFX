@@ -734,6 +734,7 @@ mod tests {
         assert_eq!(icon.width, 256);
         assert_eq!(icon.height, 256);
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        assert_eq!(&icon.rgba[0..4], &[0, 0, 0, 0]);
         assert!(LOGO_PNG_BYTES.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(Path::new("assets/icon.ico").is_file());
         assert!(Path::new("assets/icon.icns").is_file());
