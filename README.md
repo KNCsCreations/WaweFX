@@ -4,6 +4,24 @@
 
 ---
 
+## Download & Installation
+
+Pre-built installers and binaries for **Windows** and **macOS** are available on the **[Releases page](https://github.com/KNCsCreations/WaweFX/releases)**:
+
+1. Open the **[Releases](https://github.com/KNCsCreations/WaweFX/releases)** section on the right sidebar of this repository and select the latest release.
+2. Under **Assets**, download the file for your operating system:
+   - **Windows**: `WaweFX-Windows.zip` (extract and run `WaweFX.exe`)
+   - **macOS**: `WaweFX-macOS.dmg` (open the `.dmg` and drag `WaweFX.app` into **Applications**)
+
+### First-Launch Security Notes
+Because WaweFX is currently self-distributed without a paid Apple Developer / Windows Authenticode certificate, your OS may show a security prompt on first launch:
+- **Windows (SmartScreen)**: Click **More info** → **Run anyway**.
+- **macOS (Gatekeeper)**: Try opening `WaweFX.app` once, click **Done**, then go to **System Settings → Privacy & Security**, scroll down to **Security**, and click **Open Anyway**.
+
+*(Latest development builds are also generated automatically under the **Actions** tab → **Artifacts** on every commit).*
+
+---
+
 ## Features
 
 - **Dual-Stream Audio Routing & Mic Passthrough**
@@ -37,7 +55,7 @@ To route soundboard audio into Discord, games, or voice chat apps alongside your
 4. In **Discord / Game Settings**, set your Input Device to `CABLE Output (VB-Audio Virtual Cable)`.
 
 ### macOS
-1. Install **[BlackHole 2ch](https://existential.audio/blackhole/)** (or via Homebrew: `brew install blackhole-2ch`).
+1. Install **[BlackHole 2ch](https://existential.audio/blackhole/)** (or via Homebrew: `brew install blackhole-2ch`, then run `sudo killall coreaudiod` in Terminal).
 2. In **WaweFX Settings (Gear icon)**:
    - **Physical Mic Input**: Your hardware microphone
    - **Virtual Mic Output**: `BlackHole 2ch`
