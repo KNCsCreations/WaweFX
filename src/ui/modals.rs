@@ -1,10 +1,123 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
 use qrcode::{Color as QrColor, QrCode};
 
 use crate::audio::{AudioDeviceList, AudioEngine, AudioEngineStatus, apo_installer};
 use crate::config::{AppConfig, SoundItem, ThemePreset};
+
+#[cfg(target_os = "windows")]
+const VBCABLE_ZIP_URL: &str =
+    "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip";
+#[cfg(target_os = "windows")]
+const VBCABLE_WEB_URL: &str = "https://vb-audio.com/Cable/";
+#[cfg(target_os = "macos")]
+const BLACKHOLE_WEB_URL: &str = "https://existential.audio/blackhole/";
+
+/// Live background progress for the one-click Virtual Audio Driver setup wizard.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DriverInstallPhase {
+    #[default]
+    Idle,
+    Running(String),
+    Succeeded(String),
+    Failed(String),
+}
+
+/// Shared non-blocking controller for downloading/launching virtual audio driver installers.
+#[derive(Clone, Default)]
+pub struct DriverSetupState {
+    phase: Arc<Mutex<DriverInstallPhase>>,
+}
+
+impl DriverSetupState {
+    pub fn phase(&self) -> DriverInstallPhase {
+        self.phase
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or(DriverInstallPhase::Idle)
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self.phase(), DriverInstallPhase::Running(_))
+    }
+
+    fn set_phase(phase: &Arc<Mutex<DriverInstallPhase>>, next: DriverInstallPhase) {
+        if let Ok(mut guard) = phase.lock() {
+            *guard = next;
+        }
+    }
+
+    /// Launches the platform virtual audio driver installation in a background thread.
+    pub fn start_driver_install(&self) {
+        if self.is_running() {
+            return;
+        }
+        let phase = Arc::clone(&self.phase);
+        Self::set_phase(
+            &phase,
+            DriverInstallPhase::Running("Starting virtual audio driver installer...".to_string()),
+        );
+        std::thread::spawn(move || {
+            run_platform_driver_install(&phase);
+        });
+    }
+
+    /// Opens the official virtual audio driver webpage in the user's browser.
+    pub fn open_driver_website(&self) {
+        if let Err(err) = open_platform_driver_website() {
+            Self::set_phase(
+                &self.phase,
+                DriverInstallPhase::Failed(format!("Could not open browser: {err}")),
+            );
+        }
+    }
+}
+
+/// Returns `true` if `name` matches a supported virtual audio driver on Windows or macOS.
+pub fn is_known_virtual_audio_driver(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("cable input")
+        || lower.contains("vb-audio")
+        || lower.contains("voicemeeter")
+        || lower.contains("blackhole")
+        || lower.contains("loopback")
+}
+
+/// Returns `true` if any recognized virtual audio output device exists in `devices`.
+pub fn has_virtual_audio_device(devices: &AudioDeviceList) -> bool {
+    devices
+        .output_devices
+        .iter()
+        .any(|name| is_known_virtual_audio_driver(name))
+}
+
+/// Selects the best detected virtual audio output device (`CABLE Input` / `BlackHole 2ch` preferred).
+pub fn find_preferred_virtual_mic_output(devices: &AudioDeviceList) -> Option<String> {
+    let mut candidates: Vec<&String> = devices
+        .output_devices
+        .iter()
+        .filter(|name| is_known_virtual_audio_driver(name))
+        .collect();
+    candidates.sort_by(|a, b| {
+        preferred_auto_select_rank(a)
+            .cmp(&preferred_auto_select_rank(b))
+            .then_with(|| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()))
+    });
+    candidates.first().map(|s| (*s).clone())
+}
+
+fn preferred_auto_select_rank(name: &str) -> u8 {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("cable input") || lower.contains("blackhole 2ch") {
+        0
+    } else if lower.contains("blackhole") || lower.contains("vb-audio") {
+        1
+    } else {
+        2
+    }
+}
 
 /// Active overlay modal open over the soundboard UI.
 #[derive(Debug, Clone)]
@@ -59,18 +172,20 @@ pub struct ModalOutcome {
     pub close_modal: bool,
     pub save_sound: Option<SoundModalDraft>,
     pub apply_audio_config: bool,
-    pub refresh_devices: bool,
+    pub refresh_and_apply_devices: bool,
     pub open_settings: bool,
     pub config_dirty: bool,
 }
 
 /// Renders whichever modal dialog is currently active.
+#[allow(clippy::too_many_arguments)]
 pub fn render_modals(
     ctx: &egui::Context,
     modal: &mut ActiveModal,
     config: &mut AppConfig,
     devices: &AudioDeviceList,
     status: &AudioEngineStatus,
+    driver_setup: &DriverSetupState,
     local_ip: &str,
     connected_clients: usize,
 ) -> ModalOutcome {
@@ -81,10 +196,10 @@ pub fn render_modals(
             render_sound_editor_modal(ctx, draft, &mut outcome);
         }
         ActiveModal::Settings => {
-            render_settings_modal(ctx, config, devices, &mut outcome);
+            render_settings_modal(ctx, config, devices, driver_setup, &mut outcome);
         }
         ActiveModal::Alerts => {
-            render_alerts_modal(ctx, status, &mut outcome);
+            render_alerts_modal(ctx, status, devices, driver_setup, &mut outcome);
         }
         ActiveModal::CompanionPairing => {
             render_companion_modal(ctx, config.audio.sync_port, local_ip, connected_clients, &mut outcome);
@@ -239,6 +354,7 @@ fn render_settings_modal(
     ctx: &egui::Context,
     config: &mut AppConfig,
     devices: &AudioDeviceList,
+    driver_setup: &DriverSetupState,
     outcome: &mut ModalOutcome,
 ) {
     let mut open = true;
@@ -247,12 +363,17 @@ fn render_settings_modal(
         .collapsible(false)
         .resizable(true)
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .default_size(Vec2::new(500.0, 400.0))
+        .default_size(Vec2::new(520.0, 460.0))
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // --- Section 1: Audio Routing Devices ---
                 ui.heading("Audio Devices & Routing");
                 ui.add_space(4.0);
+
+                if !has_virtual_audio_device(devices) {
+                    render_virtual_driver_setup_banner(ui, driver_setup, outcome);
+                    ui.add_space(8.0);
+                }
 
                 egui::Grid::new("settings_audio_grid")
                     .num_columns(2)
@@ -384,8 +505,8 @@ fn render_settings_modal(
                         outcome.apply_audio_config = true;
                         outcome.config_dirty = true;
                     }
-                    if ui.button("Refresh Devices").clicked() {
-                        outcome.refresh_devices = true;
+                    if ui.button("Refresh & Apply Devices").clicked() {
+                        outcome.refresh_and_apply_devices = true;
                     }
                 });
 
@@ -502,70 +623,89 @@ fn color_row(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
 fn render_alerts_modal(
     ctx: &egui::Context,
     status: &AudioEngineStatus,
+    devices: &AudioDeviceList,
+    driver_setup: &DriverSetupState,
     outcome: &mut ModalOutcome,
 ) {
     let mut open = true;
+    let missing_virtual_driver = !has_virtual_audio_device(devices);
     egui::Window::new("Audio Engine Status & Alerts")
         .open(&mut open)
         .collapsible(false)
-        .resizable(false)
+        .resizable(true)
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .fixed_size(Vec2::new(470.0, 295.0))
+        .default_size(Vec2::new(500.0, if missing_virtual_driver { 410.0 } else { 315.0 }))
         .show(ctx, |ui| {
-            ui.label(egui::RichText::new(format!("Backend: {}", status.backend_name)).strong());
-            ui.add_space(4.0);
-            ui.label(format!(
-                "Physical Mic: {}",
-                status.active_mic_input.as_deref().unwrap_or("Inactive")
-            ));
-            ui.label(format!(
-                "Virtual Mic Output: {}",
-                status
-                    .active_virtual_mic_output
-                    .as_deref()
-                    .unwrap_or("Not selected")
-            ));
-            ui.label(format!(
-                "Headphones Output: {}",
-                status
-                    .active_headphones_output
-                    .as_deref()
-                    .unwrap_or("Unavailable")
-            ));
-            ui.label(format!(
-                "Mic Ring Buffer: {:.1} ms  |  Measured Rate: In {} fps / V-Mic Out {} fps",
-                status.mic_ring_fill_ms,
-                status.measured_mic_in_fps,
-                status.measured_vmic_out_fps
-            ));
-
-            ui.add_space(8.0);
-            ui.separator();
-
-            if status.warnings.is_empty() {
-                ui.colored_label(
-                    Color32::from_rgb(46, 160, 67),
-                    "All active audio streams are running normally.",
-                );
-            } else {
-                ui.label(egui::RichText::new("Warnings:").strong());
-                for warning in &status.warnings {
-                    ui.colored_label(Color32::from_rgb(235, 110, 60), format!("• {warning}"));
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if missing_virtual_driver {
+                    render_virtual_driver_setup_banner(ui, driver_setup, outcome);
+                    ui.add_space(8.0);
                 }
-            }
 
-            ui.add_space(8.0);
-            ui.small(apo_installer::query_apo_status().notes);
+                ui.label(egui::RichText::new(format!("Backend: {}", status.backend_name)).strong());
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "Physical Mic: {}",
+                    status.active_mic_input.as_deref().unwrap_or("Inactive")
+                ));
+                ui.label(format!(
+                    "Virtual Mic Output: {}",
+                    status
+                        .active_virtual_mic_output
+                        .as_deref()
+                        .unwrap_or("Not selected")
+                ));
+                ui.label(format!(
+                    "Headphones Output: {}",
+                    status
+                        .active_headphones_output
+                        .as_deref()
+                        .unwrap_or("Unavailable")
+                ));
+                ui.label(format!(
+                    "Mic Ring Buffer: {:.1} ms  |  Measured Rate: In {} fps / V-Mic Out {} fps",
+                    status.mic_ring_fill_ms,
+                    status.measured_mic_in_fps,
+                    status.measured_vmic_out_fps
+                ));
 
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button("Open Audio Settings").clicked() {
-                    outcome.open_settings = true;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Close").clicked() {
-                        outcome.close_modal = true;
+                ui.add_space(8.0);
+                ui.separator();
+
+                if status.warnings.is_empty() && !missing_virtual_driver {
+                    ui.colored_label(
+                        Color32::from_rgb(46, 160, 67),
+                        "All active audio streams are running normally.",
+                    );
+                } else {
+                    ui.label(egui::RichText::new("Warnings:").strong());
+                    if missing_virtual_driver {
+                        ui.colored_label(
+                            Color32::from_rgb(235, 110, 60),
+                            "• No virtual audio driver (VB-Cable / VoiceMeeter / BlackHole / Loopback) detected.",
+                        );
                     }
+                    for warning in &status.warnings {
+                        ui.colored_label(Color32::from_rgb(235, 110, 60), format!("• {warning}"));
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.small(apo_installer::query_apo_status().notes);
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Open Audio Settings").clicked() {
+                        outcome.open_settings = true;
+                    }
+                    if ui.button("Refresh & Apply Devices").clicked() {
+                        outcome.refresh_and_apply_devices = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            outcome.close_modal = true;
+                        }
+                    });
                 });
             });
         });
@@ -573,6 +713,105 @@ fn render_alerts_modal(
     if !open {
         outcome.close_modal = true;
     }
+}
+
+fn render_virtual_driver_setup_banner(
+    ui: &mut egui::Ui,
+    driver_setup: &DriverSetupState,
+    outcome: &mut ModalOutcome,
+) {
+    let coral = Color32::from_rgb(235, 110, 60);
+    egui::Frame::NONE
+        .fill(Color32::from_rgba_unmultiplied(255, 127, 80, 28))
+        .stroke(Stroke::new(1.5_f32, coral))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Virtual Audio Driver Required")
+                    .strong()
+                    .color(coral),
+            );
+            ui.add_space(3.0);
+
+            #[cfg(target_os = "windows")]
+            {
+                ui.small(
+                    "No VB-Cable or VoiceMeeter output device was detected. Install VB-Cable so Discord/apps can hear your soundboard & mic mix.",
+                );
+                ui.add_space(6.0);
+                let running = driver_setup.is_running();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!running, egui::Button::new("Install VB-Cable Driver"))
+                        .clicked()
+                    {
+                        driver_setup.start_driver_install();
+                    }
+                    if ui.button("Open VB-Cable Website").clicked() {
+                        driver_setup.open_driver_website();
+                    }
+                    if ui.button("Refresh & Apply Devices").clicked() {
+                        outcome.refresh_and_apply_devices = true;
+                    }
+                });
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                ui.small(
+                    "No BlackHole or Loopback virtual audio device was detected. Follow these 2 steps:",
+                );
+                ui.small("1. Click \"Install BlackHole 2ch\" (uses Homebrew if installed, or opens existential.audio).");
+                ui.small("2. Click \"Refresh & Apply Devices\" below to auto-select BlackHole 2ch.");
+                ui.add_space(6.0);
+                let running = driver_setup.is_running();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!running, egui::Button::new("Install BlackHole 2ch"))
+                        .clicked()
+                    {
+                        driver_setup.start_driver_install();
+                    }
+                    if ui.button("Open Download Page").clicked() {
+                        driver_setup.open_driver_website();
+                    }
+                    if ui.button("Refresh & Apply Devices").clicked() {
+                        outcome.refresh_and_apply_devices = true;
+                    }
+                });
+            }
+
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+            {
+                ui.small(
+                    "No virtual audio sink detected. Create a PipeWire/PulseAudio virtual sink, then click Refresh & Apply Devices.",
+                );
+                ui.add_space(6.0);
+                if ui.button("Refresh & Apply Devices").clicked() {
+                    outcome.refresh_and_apply_devices = true;
+                }
+            }
+
+            match driver_setup.phase() {
+                DriverInstallPhase::Idle => {}
+                DriverInstallPhase::Running(msg) => {
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.small(msg);
+                    });
+                }
+                DriverInstallPhase::Succeeded(msg) => {
+                    ui.add_space(5.0);
+                    ui.colored_label(Color32::from_rgb(46, 160, 67), msg);
+                }
+                DriverInstallPhase::Failed(msg) => {
+                    ui.add_space(5.0);
+                    ui.colored_label(Color32::from_rgb(220, 60, 60), msg);
+                }
+            }
+        });
 }
 
 fn render_companion_modal(
@@ -679,9 +918,263 @@ fn paint_qr_code(ui: &mut egui::Ui, code: &QrCode, size_px: f32) {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn run_platform_driver_install(phase: &Arc<Mutex<DriverInstallPhase>>) {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let temp = std::env::temp_dir();
+    let zip_path = temp.join("VBCABLE_Driver_Pack43.zip");
+    let extract_dir = temp.join("WaweFX_VBCable");
+
+    DriverSetupState::set_phase(
+        phase,
+        DriverInstallPhase::Running(
+            "Downloading and extracting VBCABLE_Driver_Pack43.zip...".to_string(),
+        ),
+    );
+
+    let dl_script = "$ErrorActionPreference = 'Stop'; \
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+        Invoke-WebRequest -Uri $env:WAWEFX_ZIP_URL -OutFile $env:WAWEFX_ZIP_PATH -UseBasicParsing; \
+        if (Test-Path -LiteralPath $env:WAWEFX_EXTRACT_DIR) { Remove-Item -LiteralPath $env:WAWEFX_EXTRACT_DIR -Recurse -Force }; \
+        Expand-Archive -LiteralPath $env:WAWEFX_ZIP_PATH -DestinationPath $env:WAWEFX_EXTRACT_DIR -Force";
+
+    let dl_out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", dl_script])
+        .env("WAWEFX_ZIP_URL", VBCABLE_ZIP_URL)
+        .env("WAWEFX_ZIP_PATH", &zip_path)
+        .env("WAWEFX_EXTRACT_DIR", &extract_dir)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    match dl_out {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("exit code {:?}", out.status.code())
+            } else {
+                stderr
+            };
+            DriverSetupState::set_phase(
+                phase,
+                DriverInstallPhase::Failed(format!(
+                    "Download/extract failed ({detail}). Try 'Open VB-Cable Website' instead."
+                )),
+            );
+            return;
+        }
+        Err(err) => {
+            DriverSetupState::set_phase(
+                phase,
+                DriverInstallPhase::Failed(format!(
+                    "Failed to launch PowerShell: {err}. Try 'Open VB-Cable Website' instead."
+                )),
+            );
+            return;
+        }
+    }
+
+    let Some(setup_exe) = find_file_recursive(&extract_dir, "VBCABLE_Setup_x64.exe") else {
+        DriverSetupState::set_phase(
+            phase,
+            DriverInstallPhase::Failed(
+                "VBCABLE_Setup_x64.exe was not found in extracted zip. Try 'Open VB-Cable Website'."
+                    .to_string(),
+            ),
+        );
+        return;
+    };
+
+    DriverSetupState::set_phase(
+        phase,
+        DriverInstallPhase::Running(
+            "Waiting for UAC elevation & VB-Cable installer to finish...".to_string(),
+        ),
+    );
+
+    let run_script =
+        "$ErrorActionPreference = 'Stop'; Start-Process -FilePath $env:WAWEFX_SETUP_EXE -Verb RunAs -Wait";
+    let setup_out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", run_script])
+        .env("WAWEFX_SETUP_EXE", &setup_exe)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+
+    match setup_out {
+        Ok(out) if out.status.success() => {
+            DriverSetupState::set_phase(
+                phase,
+                DriverInstallPhase::Succeeded(
+                    "VB-Cable installer finished. Click 'Refresh & Apply Devices' (reboot Windows if 'CABLE Input' does not appear yet).".to_string(),
+                ),
+            );
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            DriverSetupState::set_phase(
+                phase,
+                DriverInstallPhase::Failed(format!(
+                    "Installer did not complete ({}).",
+                    if stderr.is_empty() {
+                        "UAC declined or cancelled".to_string()
+                    } else {
+                        stderr
+                    }
+                )),
+            );
+        }
+        Err(err) => {
+            DriverSetupState::set_phase(
+                phase,
+                DriverInstallPhase::Failed(format!("Could not launch elevated installer: {err}")),
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn find_file_recursive(dir: &std::path::Path, target_name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.eq_ignore_ascii_case(target_name))
+        {
+            return Some(path);
+        } else if path.is_dir()
+            && let Some(found) = find_file_recursive(&path, target_name)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn open_platform_driver_website() -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    Command::new("cmd")
+        .args(["/C", "start", "", VBCABLE_WEB_URL])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn detect_homebrew_binary() -> Option<&'static str> {
+    use std::process::Command;
+
+    for candidate in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew", "brew"] {
+        if let Ok(out) = Command::new(candidate).arg("--version").output()
+            && out.status.success()
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn run_platform_driver_install(phase: &Arc<Mutex<DriverInstallPhase>>) {
+    use std::process::Command;
+
+    if let Some(brew) = detect_homebrew_binary() {
+        DriverSetupState::set_phase(
+            phase,
+            DriverInstallPhase::Running(
+                "Installing blackhole-2ch via Homebrew (brew install blackhole-2ch)...".to_string(),
+            ),
+        );
+        match Command::new(brew).args(["install", "blackhole-2ch"]).output() {
+            Ok(out) if out.status.success() => {
+                DriverSetupState::set_phase(
+                    phase,
+                    DriverInstallPhase::Succeeded(
+                        "BlackHole 2ch installed! Click 'Refresh & Apply Devices' above."
+                            .to_string(),
+                    ),
+                );
+                return;
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let _ = open_platform_driver_website();
+                DriverSetupState::set_phase(
+                    phase,
+                    DriverInstallPhase::Failed(format!(
+                        "Homebrew install failed ({stderr}). Opened existential.audio download page instead."
+                    )),
+                );
+                return;
+            }
+            Err(err) => {
+                DriverSetupState::set_phase(
+                    phase,
+                    DriverInstallPhase::Failed(format!("Failed to invoke Homebrew: {err}")),
+                );
+                return;
+            }
+        }
+    }
+
+    match open_platform_driver_website() {
+        Ok(()) => {
+            DriverSetupState::set_phase(
+                phase,
+                DriverInstallPhase::Succeeded(
+                    "Homebrew not detected; opened https://existential.audio/blackhole/. Run the installer, then click 'Refresh & Apply Devices'."
+                        .to_string(),
+                ),
+            );
+        }
+        Err(err) => {
+            DriverSetupState::set_phase(
+                phase,
+                DriverInstallPhase::Failed(format!("Could not open browser: {err}")),
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_platform_driver_website() -> std::io::Result<()> {
+    std::process::Command::new("open")
+        .arg(BLACKHOLE_WEB_URL)
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn run_platform_driver_install(phase: &Arc<Mutex<DriverInstallPhase>>) {
+    DriverSetupState::set_phase(
+        phase,
+        DriverInstallPhase::Failed(
+            "Automated driver installation is only supported on Windows and macOS.".to_string(),
+        ),
+    );
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn open_platform_driver_website() -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::virtual_mic_priority;
+    use crate::audio::AudioDeviceList;
+
+    use super::{
+        find_preferred_virtual_mic_output, has_virtual_audio_device, virtual_mic_priority,
+    };
 
     #[test]
     fn prioritizes_windows_and_macos_virtual_audio_drivers() {
@@ -694,5 +1187,46 @@ mod tests {
         assert_eq!(virtual_mic_priority("Generic Virtual Audio Device"), 1);
         assert_eq!(virtual_mic_priority("Steam Streaming Speakers"), 2);
         assert_eq!(virtual_mic_priority("MacBook Pro Speakers"), 2);
+    }
+
+    #[test]
+    fn detects_and_selects_virtual_audio_drivers_across_windows_and_macos() {
+        let none_list = AudioDeviceList {
+            input_devices: vec!["Built-in Microphone".to_string()],
+            output_devices: vec![
+                "Speakers (Realtek High Definition Audio)".to_string(),
+                "Steam Streaming Speakers".to_string(),
+            ],
+        };
+        assert!(!has_virtual_audio_device(&none_list));
+        assert_eq!(find_preferred_virtual_mic_output(&none_list), None);
+
+        let win_list = AudioDeviceList {
+            input_devices: vec![],
+            output_devices: vec![
+                "Speakers (Realtek)".to_string(),
+                "VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)".to_string(),
+                "CABLE Input (VB-Audio Virtual Cable)".to_string(),
+            ],
+        };
+        assert!(has_virtual_audio_device(&win_list));
+        assert_eq!(
+            find_preferred_virtual_mic_output(&win_list).as_deref(),
+            Some("CABLE Input (VB-Audio Virtual Cable)")
+        );
+
+        let mac_list = AudioDeviceList {
+            input_devices: vec![],
+            output_devices: vec![
+                "MacBook Pro Speakers".to_string(),
+                "Loopback Audio".to_string(),
+                "BlackHole 2ch".to_string(),
+            ],
+        };
+        assert!(has_virtual_audio_device(&mac_list));
+        assert_eq!(
+            find_preferred_virtual_mic_output(&mac_list).as_deref(),
+            Some("BlackHole 2ch")
+        );
     }
 }

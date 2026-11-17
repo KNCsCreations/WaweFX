@@ -6,8 +6,11 @@ use eframe::egui::Color32;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Persistent JSON configuration file name stored alongside the working directory.
+/// Persistent JSON configuration file name stored in the platform config directory.
 pub const CONFIG_FILE_NAME: &str = "wawefx_config.json";
+
+/// Subdirectory inside the OS configuration directory used by WaweFX.
+pub const CONFIG_APP_DIR_NAME: &str = "WaweFX";
 
 /// Uniform internal audio mixer sample rate (Hz) used across normalized sound buffers.
 pub const TARGET_SAMPLE_RATE: u32 = 48_000;
@@ -286,9 +289,19 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// Returns the default configuration file path (`wawefx_config.json` in the current directory).
+    /// Returns the platform-appropriate configuration file path:
+    /// `<config_dir>/WaweFX/wawefx_config.json` (e.g. `~/Library/Application Support/WaweFX/wawefx_config.json`
+    /// on macOS or `%APPDATA%\WaweFX\wawefx_config.json` on Windows), falling back to
+    /// `std::env::temp_dir().join("wawefx_config.json")` if no OS config directory is available.
     pub fn config_path() -> PathBuf {
-        PathBuf::from(CONFIG_FILE_NAME)
+        Self::resolve_config_path(dirs::config_dir())
+    }
+
+    fn resolve_config_path(config_dir: Option<PathBuf>) -> PathBuf {
+        match config_dir {
+            Some(dir) => dir.join(CONFIG_APP_DIR_NAME).join(CONFIG_FILE_NAME),
+            None => std::env::temp_dir().join(CONFIG_FILE_NAME),
+        }
     }
 
     /// Loads configuration from `wawefx_config.json`, falling back to defaults when missing or unreadable.
@@ -315,26 +328,34 @@ impl AppConfig {
 
     /// Saves configuration to the default `wawefx_config.json` path.
     pub fn save(&self) -> anyhow::Result<()> {
-        self.save_to_path(&Self::config_path())
+        let path = Self::config_path();
+        self.save_to_path(&path)
     }
 
-    /// Atomically serializes and writes configuration to the provided file path.
+    /// Serializes and writes configuration to the provided file path, creating parent directories if needed.
     pub fn save_to_path(&self, path: &Path) -> anyhow::Result<()> {
         let mut sanitized = self.clone();
         sanitized.sanitize();
 
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
+            && let Err(io_err) = fs::create_dir_all(parent)
         {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create config parent directory {}", parent.display())
-            })?;
+            tracing::warn!(
+                "Failed to create config directory {}: {io_err}",
+                parent.display()
+            );
+            return Err(anyhow::Error::new(io_err)
+                .context(format!("failed to create config parent directory {}", parent.display())));
         }
 
         let json = serde_json::to_string_pretty(&sanitized)
             .context("failed to serialize AppConfig to JSON")?;
-        fs::write(path, json)
-            .with_context(|| format!("failed to write config file {}", path.display()))?;
+        if let Err(io_err) = fs::write(path, json) {
+            tracing::warn!("Failed to write config file {}: {io_err}", path.display());
+            return Err(anyhow::Error::new(io_err)
+                .context(format!("failed to write config file {}", path.display())));
+        }
         Ok(())
     }
 
@@ -432,5 +453,20 @@ mod tests {
         assert_eq!(loaded.selected_sound_id.as_deref(), Some(id.as_str()));
         assert_eq!(loaded.sounds.len(), 1);
         assert_eq!(loaded.sounds[0].title, "Airhorn");
+    }
+
+    #[test]
+    fn resolves_platform_config_path_and_creates_parent_dir() {
+        let custom_base = std::env::temp_dir().join(format!("wawefx_cfg_base_{}", Uuid::new_v4()));
+        let resolved = AppConfig::resolve_config_path(Some(custom_base.clone()));
+        assert_eq!(resolved, custom_base.join("WaweFX").join(CONFIG_FILE_NAME));
+
+        let fallback = AppConfig::resolve_config_path(None);
+        assert_eq!(fallback, std::env::temp_dir().join(CONFIG_FILE_NAME));
+
+        let cfg = AppConfig::default();
+        cfg.save_to_path(&resolved).expect("save creates nested WaweFX config dir");
+        assert!(resolved.exists());
+        let _ = fs::remove_dir_all(&custom_base);
     }
 }

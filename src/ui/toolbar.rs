@@ -817,8 +817,14 @@ fn paint_alert_button(
     );
     painter.circle_filled(Pos2::new(center.x, center.y + 5.5), 1.6, cutout);
 
+    if has_warning {
+        let badge_pos = Pos2::new(center.x + 9.5, center.y - 9.5);
+        painter.circle_filled(badge_pos, 4.5, cutout);
+        painter.circle_filled(badge_pos, 3.0, Color32::from_rgb(230, 55, 55));
+    }
+
     let tip = if has_warning {
-        "Audio Engine Warning — Click for details"
+        "Audio Engine / Virtual Mic Setup Alert — Click for details"
     } else {
         "Audio Engine Status: Healthy"
     };

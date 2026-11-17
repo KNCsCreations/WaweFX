@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::audio::{AudioDeviceList, AudioEngine};
 use crate::config::{AppConfig, SoundItem, rgb_to_color32};
 use crate::sync::{DesktopSyncNotice, SyncServerHandle};
-use crate::ui::modals::{ActiveModal, SoundModalDraft};
+use crate::ui::modals::{ActiveModal, DriverSetupState, SoundModalDraft};
 
 struct DecodeRequest {
     sound_id: String,
@@ -178,6 +178,7 @@ pub struct WaweFxApp {
     pub thumbnails: ThumbnailLoader,
     pub active_modal: Option<ActiveModal>,
     pub cached_devices: AudioDeviceList,
+    pub driver_setup: DriverSetupState,
     pub local_ip: String,
     pub last_error: Option<String>,
     last_playback_state: (bool, Option<String>),
@@ -196,6 +197,7 @@ impl WaweFxApp {
             thumbnails: ThumbnailLoader::new(),
             active_modal: None,
             cached_devices,
+            driver_setup: DriverSetupState::default(),
             local_ip,
             last_error: None,
             last_playback_state,
@@ -299,6 +301,8 @@ impl eframe::App for WaweFxApp {
         }
 
         let status = self.audio.status_snapshot();
+        let show_alert_badge =
+            status.has_warning || !modals::has_virtual_audio_device(&self.cached_devices);
         let bg_toolbar = rgb_to_color32(self.config.theme.bg_toolbar);
         let bg_main = rgb_to_color32(self.config.theme.bg_main);
 
@@ -308,7 +312,7 @@ impl eframe::App for WaweFxApp {
             .show_separator_line(false)
             .frame(egui::Frame::NONE.fill(bg_toolbar))
             .show(ctx, |ui| {
-                toolbar::render_toolbar(ui, &mut self.config, &self.audio, status.has_warning)
+                toolbar::render_toolbar(ui, &mut self.config, &self.audio, show_alert_badge)
             })
             .inner;
 
@@ -355,6 +359,7 @@ impl eframe::App for WaweFxApp {
             sync_dirty = true;
         }
         if tb_action.open_alerts {
+            self.cached_devices = self.audio.available_devices();
             self.active_modal = Some(ActiveModal::Alerts);
         }
         if tb_action.open_companion {
@@ -503,6 +508,7 @@ impl eframe::App for WaweFxApp {
                 &mut modal_cfg,
                 &self.cached_devices,
                 &status,
+                &self.driver_setup,
                 &self.local_ip,
                 connected_clients,
             );
@@ -513,10 +519,18 @@ impl eframe::App for WaweFxApp {
                 sync_dirty = true;
             }
 
-            if outcome.refresh_devices {
+            if outcome.refresh_and_apply_devices {
                 self.cached_devices = self.audio.available_devices();
-            }
-            if outcome.apply_audio_config {
+                if self.config.audio.virtual_mic_output_device.is_none()
+                    && let Some(preferred) =
+                        modals::find_preferred_virtual_mic_output(&self.cached_devices)
+                {
+                    self.config.audio.virtual_mic_output_device = Some(preferred);
+                    config_dirty = true;
+                }
+                self.audio.apply_routing_config(&self.config.audio);
+                sync_dirty = true;
+            } else if outcome.apply_audio_config {
                 self.audio.apply_routing_config(&self.config.audio);
                 sync_dirty = true;
             }
@@ -534,7 +548,7 @@ impl eframe::App for WaweFxApp {
         }
 
         if config_dirty && let Err(err) = self.config.save() {
-            self.last_error = Some(format!("Failed to save config: {err}"));
+            self.last_error = Some(format!("Failed to save config: {err:#}"));
         }
 
         let current_playback = (self.audio.is_playing(), self.audio.active_sound_id());
@@ -548,9 +562,11 @@ impl eframe::App for WaweFxApp {
         }
 
         // Animate the playing pad's bottom progress bar smoothly while audio is playing,
-        // and refresh live callback telemetry while the Alerts modal is open.
+        // and refresh live callback telemetry or background driver setup progress.
         if self.audio.is_playing() {
             ctx.request_repaint_after(Duration::from_millis(33));
+        } else if self.driver_setup.is_running() {
+            ctx.request_repaint_after(Duration::from_millis(120));
         } else if matches!(self.active_modal, Some(ActiveModal::Alerts)) {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
