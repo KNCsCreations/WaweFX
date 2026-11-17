@@ -34,7 +34,7 @@ jobs:
           path: target/release/WaweFX.exe
 
   build-macos:
-    name: macOS (Universal .app)
+    name: macOS (Universal .dmg)
     runs-on: macos-latest
     steps:
       - name: Checkout repository
@@ -60,7 +60,7 @@ jobs:
       - name: Build Intel release binary
         run: cargo build --release --locked --target x86_64-apple-darwin
 
-      - name: Assemble Universal WaweFX.app bundle
+      - name: Assemble WaweFX.app and package WaweFX-macOS.dmg
         shell: bash
         run: |
           mkdir -p WaweFX.app/Contents/MacOS
@@ -72,10 +72,14 @@ jobs:
           cp macos/Info.plist WaweFX.app/Contents/Info.plist
           printf "APPL????" > WaweFX.app/Contents/PkgInfo
           codesign --force --deep --sign - WaweFX.app
-          ditto -c -k --sequesterRsrc --keepParent WaweFX.app WaweFX-macOS.zip
+          rm -rf dmg_root
+          mkdir -p dmg_root
+          mv WaweFX.app dmg_root/
+          ln -s /Applications dmg_root/Applications
+          hdiutil create -volname "WaweFX" -srcfolder dmg_root -ov -format UDZO WaweFX-macOS.dmg
 
-      - name: Upload macOS app bundle
+      - name: Upload macOS DMG installer
         uses: actions/upload-artifact@v4
         with:
           name: WaweFX-macOS
-          path: WaweFX-macOS.zip
+          path: WaweFX-macOS.dmg
