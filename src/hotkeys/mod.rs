@@ -445,6 +445,18 @@ fn parse_key_token(token: &str) -> Option<Code> {
         "f10" => Some(Code::F10),
         "f11" => Some(Code::F11),
         "f12" => Some(Code::F12),
+        "f13" => Some(Code::F13),
+        "f14" => Some(Code::F14),
+        "f15" => Some(Code::F15),
+        "f16" => Some(Code::F16),
+        "f17" => Some(Code::F17),
+        "f18" => Some(Code::F18),
+        "f19" => Some(Code::F19),
+        "f20" => Some(Code::F20),
+        "f21" => Some(Code::F21),
+        "f22" => Some(Code::F22),
+        "f23" => Some(Code::F23),
+        "f24" => Some(Code::F24),
         "numpad0" | "num0" | "kp0" => Some(Code::Numpad0),
         "numpad1" | "num1" | "kp1" => Some(Code::Numpad1),
         "numpad2" | "num2" | "kp2" => Some(Code::Numpad2),
@@ -455,6 +467,19 @@ fn parse_key_token(token: &str) -> Option<Code> {
         "numpad7" | "num7" | "kp7" => Some(Code::Numpad7),
         "numpad8" | "num8" | "kp8" => Some(Code::Numpad8),
         "numpad9" | "num9" | "kp9" => Some(Code::Numpad9),
+        "numpadadd" | "numadd" | "numplus" | "kpadd" => Some(Code::NumpadAdd),
+        "numpadsubtract" | "numsubtract" | "numsub" | "kpsubtract" => Some(Code::NumpadSubtract),
+        "numpadmultiply" | "nummultiply" | "nummul" | "kpmultiply" => Some(Code::NumpadMultiply),
+        "numpaddivide" | "numdivide" | "numdiv" | "kpdivide" => Some(Code::NumpadDivide),
+        "numpadenter" | "numenter" | "kpenter" => Some(Code::NumpadEnter),
+        "numpaddecimal" | "numdecimal" | "numdot" | "kpdecimal" => Some(Code::NumpadDecimal),
+        "pause" | "break" => Some(Code::Pause),
+        "scrolllock" | "scrlk" => Some(Code::ScrollLock),
+        "printscreen" | "prtsc" | "prtscn" => Some(Code::PrintScreen),
+        "mediaplaypause" | "playpause" => Some(Code::MediaPlayPause),
+        "mediastop" => Some(Code::MediaStop),
+        "mediatracknext" | "medianext" | "nexttrack" => Some(Code::MediaTrackNext),
+        "mediatrackprevious" | "mediaprev" | "prevtrack" => Some(Code::MediaTrackPrevious),
         "space" => Some(Code::Space),
         "enter" | "return" => Some(Code::Enter),
         "tab" => Some(Code::Tab),
@@ -535,6 +560,18 @@ fn egui_key_to_code(key: egui::Key) -> Option<Code> {
         K::F10 => Code::F10,
         K::F11 => Code::F11,
         K::F12 => Code::F12,
+        K::F13 => Code::F13,
+        K::F14 => Code::F14,
+        K::F15 => Code::F15,
+        K::F16 => Code::F16,
+        K::F17 => Code::F17,
+        K::F18 => Code::F18,
+        K::F19 => Code::F19,
+        K::F20 => Code::F20,
+        K::F21 => Code::F21,
+        K::F22 => Code::F22,
+        K::F23 => Code::F23,
+        K::F24 => Code::F24,
         K::Space => Code::Space,
         K::Enter => Code::Enter,
         K::Tab => Code::Tab,
@@ -640,6 +677,18 @@ fn code_display_name(code: Code) -> &'static str {
         Code::F10 => "F10",
         Code::F11 => "F11",
         Code::F12 => "F12",
+        Code::F13 => "F13",
+        Code::F14 => "F14",
+        Code::F15 => "F15",
+        Code::F16 => "F16",
+        Code::F17 => "F17",
+        Code::F18 => "F18",
+        Code::F19 => "F19",
+        Code::F20 => "F20",
+        Code::F21 => "F21",
+        Code::F22 => "F22",
+        Code::F23 => "F23",
+        Code::F24 => "F24",
         Code::Numpad0 => "Numpad0",
         Code::Numpad1 => "Numpad1",
         Code::Numpad2 => "Numpad2",
@@ -650,6 +699,19 @@ fn code_display_name(code: Code) -> &'static str {
         Code::Numpad7 => "Numpad7",
         Code::Numpad8 => "Numpad8",
         Code::Numpad9 => "Numpad9",
+        Code::NumpadAdd => "NumpadAdd",
+        Code::NumpadSubtract => "NumpadSubtract",
+        Code::NumpadMultiply => "NumpadMultiply",
+        Code::NumpadDivide => "NumpadDivide",
+        Code::NumpadEnter => "NumpadEnter",
+        Code::NumpadDecimal => "NumpadDecimal",
+        Code::Pause => "Pause",
+        Code::ScrollLock => "ScrollLock",
+        Code::PrintScreen => "PrintScreen",
+        Code::MediaPlayPause => "MediaPlayPause",
+        Code::MediaStop => "MediaStop",
+        Code::MediaTrackNext => "MediaTrackNext",
+        Code::MediaTrackPrevious => "MediaTrackPrevious",
         Code::Space => "Space",
         Code::Enter => "Enter",
         Code::Tab => "Tab",
@@ -727,6 +789,35 @@ mod tests {
     fn formats_compact_card_badges() {
         assert_eq!(badge_label("Ctrl+Shift+1"), "CTRL+SHIFT+1");
         assert_eq!(badge_label("F9"), "F9");
+        assert_eq!(badge_label("F24"), "F24");
         assert_eq!(badge_label("Numpad1"), "NUM1");
+    }
+
+    #[test]
+    fn parses_extended_function_numpad_media_and_navigation_keys() {
+        for n in 13..=24 {
+            let label = format!("F{n}");
+            let hk = parse_shortcut(&label).expect("F13..F24 should parse");
+            assert_eq!(normalize_shortcut(&label.to_lowercase()).unwrap(), label);
+            assert_eq!(super::code_display_name(hk.key), label);
+        }
+
+        assert_eq!(parse_shortcut("Ctrl+F20").unwrap().key, Code::F20);
+        assert_eq!(parse_shortcut("NumpadAdd").unwrap().key, Code::NumpadAdd);
+        assert_eq!(parse_shortcut("NumpadSubtract").unwrap().key, Code::NumpadSubtract);
+        assert_eq!(parse_shortcut("NumpadMultiply").unwrap().key, Code::NumpadMultiply);
+        assert_eq!(parse_shortcut("NumpadDivide").unwrap().key, Code::NumpadDivide);
+        assert_eq!(parse_shortcut("NumpadEnter").unwrap().key, Code::NumpadEnter);
+        assert_eq!(parse_shortcut("NumpadDecimal").unwrap().key, Code::NumpadDecimal);
+        assert_eq!(parse_shortcut("Pause").unwrap().key, Code::Pause);
+        assert_eq!(parse_shortcut("ScrollLock").unwrap().key, Code::ScrollLock);
+        assert_eq!(parse_shortcut("PrintScreen").unwrap().key, Code::PrintScreen);
+        assert_eq!(parse_shortcut("MediaPlayPause").unwrap().key, Code::MediaPlayPause);
+        assert_eq!(parse_shortcut("Insert").unwrap().key, Code::Insert);
+        assert_eq!(parse_shortcut("PageDown").unwrap().key, Code::PageDown);
+        assert_eq!(parse_shortcut("BracketLeft").unwrap().key, Code::BracketLeft);
+
+        assert_eq!(super::egui_key_to_code(eframe::egui::Key::F13), Some(Code::F13));
+        assert_eq!(super::egui_key_to_code(eframe::egui::Key::F24), Some(Code::F24));
     }
 }

@@ -444,8 +444,8 @@ fn render_shortcut_picker(
             let resp = ui.add(
                 egui::TextEdit::singleline(shortcut_input)
                     .id(id)
-                    .desired_width(128.0)
-                    .hint_text("Ctrl+1 / F9 / Numpad1"),
+                    .desired_width(136.0)
+                    .hint_text("Ctrl+1 / F13 / Numpad1"),
             );
             if resp.changed() {
                 let trimmed = shortcut_input.trim();
