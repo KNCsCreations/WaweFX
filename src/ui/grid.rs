@@ -57,13 +57,36 @@ pub fn render_sound_grid(
     let card_width = ((avail_width - spacing * (cols as f32 - 1.0)) / cols as f32).max(110.0);
     let card_height = card_width + 38.0;
 
-    let drag_key = Id::new("wawefx_pad_drag_source");
-    let mut dragging_id: Option<String> = ui.data_mut(|d| d.get_temp(drag_key));
-    let pointer_pos = ui.input(|i| i.pointer.latest_pos().or(i.pointer.interact_pos()));
-    let primary_down = ui.input(|i| i.pointer.primary_down());
+    #[derive(Clone, Default)]
+    struct PadDragState {
+        candidate_id: Option<String>,
+        origin_pos: Option<Pos2>,
+        active_id: Option<String>,
+    }
+
+    let drag_key = Id::new("wawefx_pad_drag_state");
+    let mut drag_state: PadDragState = ui.data_mut(|d| d.get_temp(drag_key)).unwrap_or_default();
+    let (pointer_pos, press_origin, primary_down, primary_pressed) = ui.input(|i| {
+        (
+            i.pointer.latest_pos().or(i.pointer.interact_pos()),
+            i.pointer.press_origin(),
+            i.pointer.primary_down(),
+            i.pointer.primary_pressed(),
+        )
+    });
+
+    if primary_down
+        && drag_state.active_id.is_none()
+        && let (Some(cand_id), Some(origin), Some(cur)) =
+            (&drag_state.candidate_id, drag_state.origin_pos, pointer_pos)
+        && origin.distance(cur) > 6.0
+    {
+        drag_state.active_id = Some(cand_id.clone());
+    }
 
     let sounds_snapshot: Vec<SoundItem> = config.sounds.clone();
-    let dragging_src_idx = dragging_id
+    let dragging_src_idx = drag_state
+        .active_id
         .as_deref()
         .and_then(|id| sounds_snapshot.iter().position(|s| s.id == id));
     let mut drop_target_idx: Option<usize> = None;
@@ -79,7 +102,8 @@ pub fn render_sound_grid(
                         let is_playing_this =
                             active_playing_id.as_deref() == Some(sound.id.as_str());
                         let is_selected = selected_id.as_deref() == Some(sound.id.as_str());
-                        let is_being_dragged = dragging_id.as_deref() == Some(sound.id.as_str());
+                        let is_being_dragged =
+                            drag_state.active_id.as_deref() == Some(sound.id.as_str());
 
                         let (rect, resp) = ui.allocate_exact_size(
                             Vec2::new(card_width, card_height),
@@ -87,16 +111,23 @@ pub fn render_sound_grid(
                         );
                         action.pad_rects.push((sound.id.clone(), rect));
 
-                        if resp.drag_started_by(egui::PointerButton::Primary) {
-                            dragging_id = Some(sound.id.clone());
+                        let pointer_over_card = pointer_pos.is_some_and(|p| rect.contains(p));
+                        if drag_state.active_id.is_none()
+                            && ((primary_pressed && pointer_over_card)
+                                || resp.drag_started_by(egui::PointerButton::Primary))
+                            && drag_state.candidate_id.as_deref() != Some(sound.id.as_str())
+                        {
+                            drag_state.candidate_id = Some(sound.id.clone());
+                            drag_state.origin_pos = press_origin.or(pointer_pos);
                         }
 
-                        let pointer_over_card = pointer_pos.is_some_and(|p| rect.contains(p));
+                        let is_drop_hover_target =
+                            dragging_src_idx.is_some() && !is_being_dragged && pointer_over_card;
                         let is_image_drop_target = hovered_image_drop && pointer_over_card;
 
                         let fill = if is_being_dragged {
                             dim_color(card_bg, 0.55)
-                        } else if resp.hovered() || is_image_drop_target {
+                        } else if resp.hovered() || is_image_drop_target || is_drop_hover_target {
                             card_hover
                         } else {
                             card_bg
@@ -119,7 +150,9 @@ pub fn render_sound_grid(
 
                         painter.rect_filled(rect, CornerRadius::same(10), fill);
 
-                        let border_stroke = if is_image_drop_target || is_playing_this {
+                        let border_stroke = if is_drop_hover_target {
+                            Stroke::new(2.6_f32, accent)
+                        } else if is_image_drop_target || is_playing_this {
                             Stroke::new(2.2_f32, accent)
                         } else if is_selected {
                             Stroke::new(1.8_f32, icon_primary)
@@ -335,43 +368,49 @@ pub fn render_sound_grid(
             }
         });
 
-    // Finalize drag ghost preview or drop-to-reorder
-    if let Some(ref src_id) = dragging_id {
-        if primary_down {
-            ui.data_mut(|d| d.insert_temp(drag_key, Some(src_id.clone())));
-            if let (Some(pos), Some(src_idx)) = (pointer_pos, dragging_src_idx) {
-                let ghost_painter = ui
-                    .ctx()
-                    .layer_painter(LayerId::new(Order::Tooltip, Id::new("pad_drag_ghost")));
-                let title = &sounds_snapshot[src_idx].title;
-                let pill = Rect::from_center_size(pos + Vec2::new(14.0, -14.0), Vec2::new(130.0, 26.0));
-                ghost_painter.rect_filled(pill, CornerRadius::same(7), card_hover);
-                ghost_painter.rect_stroke(
-                    pill,
-                    CornerRadius::same(7),
-                    Stroke::new(1.5_f32, accent),
-                    StrokeKind::Inside,
-                );
-                ghost_painter.text(
-                    pill.center(),
-                    egui::Align2::CENTER_CENTER,
-                    title,
-                    egui::FontId::proportional(11.5),
-                    text_color,
-                );
-            }
-        } else {
-            ui.data_mut(|d| d.remove::<Option<String>>(drag_key));
-            if let (Some(src_idx), Some(target_idx)) = (dragging_src_idx, drop_target_idx)
-                && src_idx != target_idx
-                && src_idx < config.sounds.len()
-                && target_idx < config.sounds.len()
-            {
-                let item = config.sounds.remove(src_idx);
-                config.sounds.insert(target_idx, item);
-                action.config_dirty = true;
-            }
+    // Finalize drag ghost preview or drop-to-reorder (requiring > 6.0 px movement)
+    if primary_down {
+        if let (Some(pos), Some(src_idx)) = (pointer_pos, dragging_src_idx) {
+            let ghost_painter = ui
+                .ctx()
+                .layer_painter(LayerId::new(Order::Tooltip, Id::new("pad_drag_ghost")));
+            let title = &sounds_snapshot[src_idx].title;
+            let pill = Rect::from_center_size(pos + Vec2::new(14.0, -14.0), Vec2::new(136.0, 28.0));
+            let ghost_bg = Color32::from_rgba_unmultiplied(
+                card_hover.r(),
+                card_hover.g(),
+                card_hover.b(),
+                215,
+            );
+            ghost_painter.rect_filled(pill, CornerRadius::same(7), ghost_bg);
+            ghost_painter.rect_stroke(
+                pill,
+                CornerRadius::same(7),
+                Stroke::new(1.8_f32, accent),
+                StrokeKind::Inside,
+            );
+            ghost_painter.text(
+                pill.center(),
+                egui::Align2::CENTER_CENTER,
+                title,
+                egui::FontId::proportional(11.5),
+                text_color,
+            );
         }
+        ui.data_mut(|d| d.insert_temp(drag_key, drag_state));
+    } else {
+        if let (Some(src_idx), Some(target_idx)) = (dragging_src_idx, drop_target_idx)
+            && src_idx != target_idx
+            && src_idx < config.sounds.len()
+            && target_idx < config.sounds.len()
+        {
+            let item = config.sounds.remove(src_idx);
+            let dragged_id = item.id.clone();
+            config.sounds.insert(target_idx, item);
+            config.selected_sound_id = Some(dragged_id);
+            action.config_dirty = true;
+        }
+        ui.data_mut(|d| d.remove::<PadDragState>(drag_key));
     }
 
     action

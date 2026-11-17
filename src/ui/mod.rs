@@ -333,6 +333,15 @@ impl eframe::App for WaweFxApp {
                 DesktopSyncNotice::SetHeadphonesEnabled(enabled) => {
                     self.config.audio.headphones_stream_enabled = enabled;
                 }
+                DesktopSyncNotice::ReorderSounds { from, to } => {
+                    if from < self.config.sounds.len()
+                        && to < self.config.sounds.len()
+                        && from != to
+                    {
+                        let item = self.config.sounds.remove(from);
+                        self.config.sounds.insert(to, item);
+                    }
+                }
             }
             config_dirty = true;
         }

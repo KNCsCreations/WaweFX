@@ -10,10 +10,10 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Json, Path as AxumPath, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use eframe::egui;
 use image::{ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
@@ -137,6 +137,24 @@ pub enum RemoteCommand {
     },
     ToggleMic,
     ToggleHeadphones,
+    Reorder {
+        from: usize,
+        to: usize,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReorderRequest {
+    from: usize,
+    to: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyReorderMessage {
+    #[serde(rename = "type")]
+    kind: String,
+    from: usize,
+    to: usize,
 }
 
 /// Configuration synchronization notices applied on the desktop UI thread.
@@ -146,6 +164,7 @@ pub enum DesktopSyncNotice {
     SetPitch(f32),
     SetMicEnabled(bool),
     SetHeadphonesEnabled(bool),
+    ReorderSounds { from: usize, to: usize },
 }
 
 struct CachedThumbBytes {
@@ -551,9 +570,21 @@ fn build_router(shared: Arc<SyncShared>) -> Router {
     Router::new()
         .route("/", get(serve_mobile_index))
         .route("/api/state", get(serve_api_state))
+        .route("/api/reorder", post(handle_api_reorder))
         .route("/api/thumbnails/{id}", get(serve_thumbnail))
         .route("/ws", get(ws_handler))
         .with_state(shared)
+}
+
+async fn handle_api_reorder(
+    State(shared): State<Arc<SyncShared>>,
+    Json(req): Json<ReorderRequest>,
+) -> StatusCode {
+    if apply_remote_reorder(&shared, req.from, req.to) {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    }
 }
 
 async fn serve_mobile_index() -> Html<&'static str> {
@@ -743,8 +774,43 @@ async fn handle_ws_client(mut socket: WebSocket, shared: Arc<SyncShared>) {
     }
 }
 
+fn parse_ws_command(raw_json: &str) -> Result<RemoteCommand, serde_json::Error> {
+    if let Ok(cmd) = serde_json::from_str::<RemoteCommand>(raw_json) {
+        return Ok(cmd);
+    }
+    if let Ok(legacy) = serde_json::from_str::<LegacyReorderMessage>(raw_json)
+        && legacy.kind.eq_ignore_ascii_case("reorder")
+    {
+        return Ok(RemoteCommand::Reorder {
+            from: legacy.from,
+            to: legacy.to,
+        });
+    }
+    serde_json::from_str::<RemoteCommand>(raw_json)
+}
+
+fn apply_remote_reorder(shared: &SyncShared, from: usize, to: usize) -> bool {
+    let reordered = if let Ok(mut guard) = shared.sounds.write() {
+        if from < guard.len() && to < guard.len() && from != to {
+            let item = guard.remove(from);
+            guard.insert(to, item);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if reordered {
+        shared.push_desktop_notice(DesktopSyncNotice::ReorderSounds { from, to });
+        shared.broadcast_structural_update();
+    }
+    reordered
+}
+
 fn handle_ws_command(shared: &SyncShared, raw_json: &str) {
-    let cmd: RemoteCommand = match serde_json::from_str(raw_json) {
+    let cmd: RemoteCommand = match parse_ws_command(raw_json) {
         Ok(c) => c,
         Err(err) => {
             tracing::warn!("Ignored malformed WebSocket command '{raw_json}': {err}");
@@ -808,6 +874,9 @@ fn handle_ws_command(shared: &SyncShared, raw_json: &str) {
             shared.audio.set_headphones_enabled(next);
             shared.push_desktop_notice(DesktopSyncNotice::SetHeadphonesEnabled(next));
             shared.broadcast_playback_tick();
+        }
+        RemoteCommand::Reorder { from, to } => {
+            apply_remote_reorder(shared, from, to);
         }
     }
 }
@@ -1020,6 +1089,34 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
   .pad-card.playing {
     border-color: var(--accent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 34%, transparent);
+  }
+  .pad-card.dragging {
+    opacity: 0.42;
+    transform: scale(0.95);
+  }
+  .pad-card.drop-target {
+    border-color: var(--accent);
+    background: var(--pad-hover);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent);
+    transform: scale(1.03);
+  }
+  .drag-ghost {
+    position: fixed;
+    z-index: 9999;
+    pointer-events: none;
+    padding: 7px 12px;
+    border-radius: 8px;
+    background: var(--pad-hover);
+    color: var(--pad-text);
+    border: 2px solid var(--accent);
+    font-size: 0.82rem;
+    font-weight: 700;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.24);
+    transform: translate(-50%, -125%);
+    white-space: nowrap;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .pad-media {
     width: 100%;
@@ -1297,8 +1394,210 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
   function sendCmd(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(obj));
+      return true;
+    }
+    return false;
+  }
+
+  let dragState = {
+    active: false,
+    srcId: null,
+    srcCard: null,
+    targetId: null,
+    targetCard: null,
+    ghostEl: null,
+    justDraggedTs: 0,
+  };
+  let mouseCand = null;
+
+  function clearDropTarget() {
+    if (dragState.targetCard) {
+      dragState.targetCard.classList.remove('drop-target');
+      dragState.targetCard = null;
+    }
+    dragState.targetId = null;
+  }
+
+  function updateDragHover(clientX, clientY) {
+    if (!dragState.active) return;
+    if (dragState.ghostEl) {
+      dragState.ghostEl.style.left = clientX + 'px';
+      dragState.ghostEl.style.top = clientY + 'px';
+    }
+    const el = document.elementFromPoint(clientX, clientY);
+    const hitCard = el ? el.closest('.pad-card') : null;
+    if (hitCard && hitCard !== dragState.srcCard && hitCard.dataset.id) {
+      if (dragState.targetCard !== hitCard) {
+        clearDropTarget();
+        dragState.targetCard = hitCard;
+        dragState.targetId = hitCard.dataset.id;
+        hitCard.classList.add('drop-target');
+      }
+    } else {
+      clearDropTarget();
     }
   }
+
+  function startReorderDrag(card, id, clientX, clientY) {
+    if (dragState.active) return;
+    dragState.active = true;
+    dragState.srcId = id;
+    dragState.srcCard = card;
+    card.classList.add('dragging');
+    const titleNode = card.querySelector('.pad-title');
+    const ghost = document.createElement('div');
+    ghost.className = 'drag-ghost';
+    ghost.textContent = titleNode ? titleNode.textContent : 'Moving pad';
+    ghost.style.left = clientX + 'px';
+    ghost.style.top = clientY + 'px';
+    document.body.appendChild(ghost);
+    dragState.ghostEl = ghost;
+    if (navigator.vibrate) {
+      try { navigator.vibrate(12); } catch (_) {}
+    }
+  }
+
+  function cleanupReorderVisuals() {
+    if (dragState.srcCard) dragState.srcCard.classList.remove('dragging');
+    clearDropTarget();
+    if (dragState.ghostEl) {
+      dragState.ghostEl.remove();
+      dragState.ghostEl = null;
+    }
+    dragState.active = false;
+    dragState.srcId = null;
+    dragState.srcCard = null;
+  }
+
+  function commitReorder(fromIdx, toIdx) {
+    if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return;
+    if (fromIdx >= currentSounds.length || toIdx >= currentSounds.length) return;
+    const moved = currentSounds.splice(fromIdx, 1)[0];
+    currentSounds.splice(toIdx, 0, moved);
+    syncSoundCards(currentSounds);
+    if (!sendCmd({ type: 'reorder', from: fromIdx, to: toIdx })) {
+      fetch('/api/reorder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: fromIdx, to: toIdx }),
+      }).catch(() => {});
+    }
+  }
+
+  function finishReorderDrag() {
+    if (!dragState.active) return;
+    const srcId = dragState.srcId;
+    const targetId = dragState.targetId;
+    dragState.justDraggedTs = Date.now();
+    cleanupReorderVisuals();
+    if (srcId && targetId && srcId !== targetId) {
+      const fromIdx = currentSounds.findIndex((s) => s.id === srcId);
+      const toIdx = currentSounds.findIndex((s) => s.id === targetId);
+      commitReorder(fromIdx, toIdx);
+    }
+  }
+
+  function bindPadInteractions(el, id) {
+    let lastTouchTs = 0;
+    let startX = 0;
+    let startY = 0;
+    let moved = false;
+    let holdTimer = null;
+
+    function cancelHold() {
+      if (holdTimer) {
+        clearTimeout(holdTimer);
+        holdTimer = null;
+      }
+    }
+
+    el.addEventListener('touchstart', (ev) => {
+      if (ev.touches.length !== 1) return;
+      const t = ev.touches[0];
+      startX = t.clientX;
+      startY = t.clientY;
+      moved = false;
+      cancelHold();
+      holdTimer = setTimeout(() => {
+        holdTimer = null;
+        if (!moved) {
+          startReorderDrag(el, id, startX, startY);
+        }
+      }, 250);
+    }, { passive: true });
+
+    el.addEventListener('touchmove', (ev) => {
+      if (ev.touches.length !== 1) return;
+      const t = ev.touches[0];
+      if (dragState.active && dragState.srcCard === el) {
+        ev.preventDefault();
+        updateDragHover(t.clientX, t.clientY);
+        return;
+      }
+      const dx = t.clientX - startX;
+      const dy = t.clientY - startY;
+      if (dx * dx + dy * dy > 100) {
+        moved = true;
+        cancelHold();
+      }
+    }, { passive: false });
+
+    el.addEventListener('touchend', (ev) => {
+      cancelHold();
+      lastTouchTs = Date.now();
+      if (dragState.active && dragState.srcCard === el) {
+        ev.preventDefault();
+        finishReorderDrag();
+        return;
+      }
+      if (moved) return;
+      ev.preventDefault();
+      sendCmd({ cmd: 'PlaySound', id });
+    }, { passive: false });
+
+    el.addEventListener('touchcancel', () => {
+      cancelHold();
+      if (dragState.active && dragState.srcCard === el) {
+        cleanupReorderVisuals();
+      }
+    });
+
+    el.addEventListener('mousedown', (ev) => {
+      if (ev.button !== 0) return;
+      mouseCand = { el, id, startX: ev.clientX, startY: ev.clientY };
+    });
+
+    el.addEventListener('click', (ev) => {
+      if (Date.now() - lastTouchTs < 500 || Date.now() - dragState.justDraggedTs < 350) {
+        ev.preventDefault();
+        return;
+      }
+      sendCmd({ cmd: 'PlaySound', id });
+    });
+  }
+
+  window.addEventListener('mousemove', (ev) => {
+    if (dragState.active) {
+      updateDragHover(ev.clientX, ev.clientY);
+      return;
+    }
+    if (mouseCand) {
+      const dx = ev.clientX - mouseCand.startX;
+      const dy = ev.clientY - mouseCand.startY;
+      if (dx * dx + dy * dy > 64) {
+        const c = mouseCand;
+        mouseCand = null;
+        startReorderDrag(c.el, c.id, ev.clientX, ev.clientY);
+      }
+    }
+  });
+
+  window.addEventListener('mouseup', () => {
+    mouseCand = null;
+    if (dragState.active) {
+      finishReorderDrag();
+    }
+  });
 
   function fmtTime(secs) {
     const t = Math.max(0, Math.round(Number(secs || 0)));
@@ -1356,7 +1655,7 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
     btn.type = 'button';
     btn.className = 'pad-card';
     btn.dataset.id = s.id;
-    bindFastTap(btn, () => sendCmd({ cmd: 'PlaySound', id: s.id }));
+    bindPadInteractions(btn, s.id);
 
     const media = document.createElement('div');
     media.className = 'pad-media';
@@ -1622,6 +1921,38 @@ mod tests {
 
         let hp: RemoteCommand = serde_json::from_str(r#"{"cmd":"ToggleHeadphones"}"#).unwrap();
         assert_eq!(hp, RemoteCommand::ToggleHeadphones);
+
+        let reorder_ws = parse_ws_command(r#"{"cmd":"Reorder","from":0,"to":2}"#).unwrap();
+        assert_eq!(reorder_ws, RemoteCommand::Reorder { from: 0, to: 2 });
+
+        let reorder_type = parse_ws_command(r#"{"type":"reorder","from":1,"to":0}"#).unwrap();
+        assert_eq!(reorder_type, RemoteCommand::Reorder { from: 1, to: 0 });
+    }
+
+    #[test]
+    fn remote_reorder_shifts_sounds_and_notifies_desktop() {
+        let mut cfg = AppConfig::default();
+        cfg.sounds.push(SoundItem::new("First", PathBuf::from("1.wav"), None, 1.0));
+        cfg.sounds.push(SoundItem::new("Second", PathBuf::from("2.wav"), None, 1.0));
+        cfg.sounds.push(SoundItem::new("Third", PathBuf::from("3.wav"), None, 1.0));
+        let engine = AudioEngine::new(&cfg.audio);
+        let shared = SyncShared::new(&cfg, engine);
+
+        assert!(apply_remote_reorder(&shared, 0, 2));
+        let titles: Vec<String> = shared
+            .sounds
+            .read()
+            .unwrap()
+            .iter()
+            .map(|s| s.title.clone())
+            .collect();
+        assert_eq!(titles, vec!["Second", "Third", "First"]);
+
+        let notices = shared.desktop_notices.lock().unwrap();
+        assert_eq!(
+            notices.as_slice(),
+            &[DesktopSyncNotice::ReorderSounds { from: 0, to: 2 }]
+        );
     }
 
     #[test]

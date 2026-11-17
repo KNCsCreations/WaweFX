@@ -21,6 +21,8 @@ fn main() -> eframe::Result {
             .with_inner_size([840.0, 470.0])
             .with_min_inner_size([720.0, 360.0])
             .with_icon(Arc::new(ui::build_window_icon())),
+        vsync: false,
+        hardware_acceleration: eframe::HardwareAcceleration::Preferred,
         ..Default::default()
     };
 
