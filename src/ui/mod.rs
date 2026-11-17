@@ -164,24 +164,12 @@ pub fn build_window_icon() -> egui::IconData {
     }
 }
 
-/// Decodes the embedded `assets/logo.png` into a crisp HiDPI GPU texture for the top-left header.
-fn load_header_logo_texture(ctx: &egui::Context) -> Option<TextureHandle> {
-    let decoded = image::load_from_memory(LOGO_PNG_BYTES).ok()?;
-    let resized = decoded
-        .resize_exact(128, 128, FilterType::Lanczos3)
-        .to_rgba8();
-    let size = [resized.width() as usize, resized.height() as usize];
-    let image = ColorImage::from_rgba_unmultiplied(size, resized.as_raw());
-    Some(ctx.load_texture("wawefx_header_logo", image, TextureOptions::LINEAR))
-}
-
 /// Root eframe application state for WaweFX.
 pub struct WaweFxApp {
     pub config: AppConfig,
     pub audio: AudioEngine,
     pub sync: SyncServerHandle,
     pub thumbnails: ThumbnailLoader,
-    pub logo_texture: Option<TextureHandle>,
     pub active_modal: Option<ActiveModal>,
     pub cached_devices: AudioDeviceList,
     pub driver_setup: DriverSetupState,
@@ -203,14 +191,12 @@ impl WaweFxApp {
         let last_playback_state = (audio.is_playing(), audio.active_sound_id());
         let mut hotkeys = HotkeyService::new(ctx);
         hotkeys.sync_bindings(&config);
-        let logo_texture = load_header_logo_texture(ctx);
 
         Self {
             config,
             audio,
             sync,
             thumbnails: ThumbnailLoader::new(),
-            logo_texture,
             active_modal: None,
             cached_devices,
             driver_setup: DriverSetupState::default(),
@@ -364,13 +350,7 @@ impl eframe::App for WaweFxApp {
             .show_separator_line(false)
             .frame(egui::Frame::NONE.fill(bg_toolbar))
             .show(ctx, |ui| {
-                toolbar::render_toolbar(
-                    ui,
-                    &mut self.config,
-                    &self.audio,
-                    self.logo_texture.as_ref(),
-                    show_alert_badge,
-                )
+                toolbar::render_toolbar(ui, &mut self.config, &self.audio, show_alert_badge)
             })
             .inner;
 
