@@ -10,7 +10,11 @@ use std::time::Duration;
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use image::ImageReader;
+use image::imageops::FilterType;
 use uuid::Uuid;
+
+/// Embedded WaweFX brand logo PNG bytes compiled directly into the standalone binary.
+pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../assets/logo.png");
 
 use crate::audio::{AudioDeviceList, AudioEngine};
 use crate::config::{AppConfig, SoundItem, rgb_to_color32};
@@ -137,38 +141,38 @@ fn decode_thumbnail_image(path: &Path) -> Option<ColorImage> {
     Some(ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()))
 }
 
-/// Generates a clean 32×32 RGBA icon for the Windows titlebar and taskbar.
+/// Decodes the embedded `assets/logo.png` into a 256x256 RGBA [`egui::IconData`] for the
+/// application window titlebar, Windows Taskbar, and macOS Dock.
 pub fn build_window_icon() -> egui::IconData {
-    let size = 32usize;
-    let mut rgba = vec![0u8; size * size * 4];
-    let bg = [0xF4u8, 0xEF, 0xE6, 0xFF];
-    let fg = [0x2Bu8, 0x25, 0x20, 0xFF];
-    let accent = [0xB0u8, 0x89, 0x68, 0xFF];
-
-    for y in 0..size {
-        for x in 0..size {
-            let idx = (y * size + x) * 4;
-            let dx = x as f32 - 15.5;
-            let dy = y as f32 - 15.5;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let col = if dist <= 14.5 && dist >= 10.5 && (dx + dy).abs() < 11.0 {
-                fg
-            } else if dist <= 6.5 {
-                accent
-            } else if dist <= 15.0 {
-                bg
-            } else {
-                [0, 0, 0, 0]
-            };
-            rgba[idx..idx + 4].copy_from_slice(&col);
-        }
+    if let Ok(decoded) = image::load_from_memory(LOGO_PNG_BYTES) {
+        let resized = decoded
+            .resize_exact(256, 256, FilterType::Lanczos3)
+            .to_rgba8();
+        return egui::IconData {
+            rgba: resized.into_raw(),
+            width: 256,
+            height: 256,
+        };
     }
 
+    let size = 32usize;
+    let rgba = vec![0xF4u8; size * size * 4];
     egui::IconData {
         rgba,
         width: size as u32,
         height: size as u32,
     }
+}
+
+/// Decodes the embedded `assets/logo.png` into a crisp HiDPI GPU texture for the top-left header.
+fn load_header_logo_texture(ctx: &egui::Context) -> Option<TextureHandle> {
+    let decoded = image::load_from_memory(LOGO_PNG_BYTES).ok()?;
+    let resized = decoded
+        .resize_exact(128, 128, FilterType::Lanczos3)
+        .to_rgba8();
+    let size = [resized.width() as usize, resized.height() as usize];
+    let image = ColorImage::from_rgba_unmultiplied(size, resized.as_raw());
+    Some(ctx.load_texture("wawefx_header_logo", image, TextureOptions::LINEAR))
 }
 
 /// Root eframe application state for WaweFX.
@@ -177,6 +181,7 @@ pub struct WaweFxApp {
     pub audio: AudioEngine,
     pub sync: SyncServerHandle,
     pub thumbnails: ThumbnailLoader,
+    pub logo_texture: Option<TextureHandle>,
     pub active_modal: Option<ActiveModal>,
     pub cached_devices: AudioDeviceList,
     pub driver_setup: DriverSetupState,
@@ -198,12 +203,14 @@ impl WaweFxApp {
         let last_playback_state = (audio.is_playing(), audio.active_sound_id());
         let mut hotkeys = HotkeyService::new(ctx);
         hotkeys.sync_bindings(&config);
+        let logo_texture = load_header_logo_texture(ctx);
 
         Self {
             config,
             audio,
             sync,
             thumbnails: ThumbnailLoader::new(),
+            logo_texture,
             active_modal: None,
             cached_devices,
             driver_setup: DriverSetupState::default(),
@@ -357,7 +364,13 @@ impl eframe::App for WaweFxApp {
             .show_separator_line(false)
             .frame(egui::Frame::NONE.fill(bg_toolbar))
             .show(ctx, |ui| {
-                toolbar::render_toolbar(ui, &mut self.config, &self.audio, show_alert_badge)
+                toolbar::render_toolbar(
+                    ui,
+                    &mut self.config,
+                    &self.audio,
+                    self.logo_texture.as_ref(),
+                    show_alert_badge,
+                )
             })
             .inner;
 
@@ -727,4 +740,22 @@ fn is_audio_file(path: &Path) -> bool {
 
 fn is_image_file(path: &Path) -> bool {
     has_extension_in(path, &["png", "jpg", "jpeg", "webp"])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{LOGO_PNG_BYTES, build_window_icon};
+
+    #[test]
+    fn decodes_embedded_logo_and_platform_icon_assets_exist() {
+        let icon = build_window_icon();
+        assert_eq!(icon.width, 256);
+        assert_eq!(icon.height, 256);
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        assert!(LOGO_PNG_BYTES.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(Path::new("assets/icon.ico").is_file());
+        assert!(Path::new("assets/icon.icns").is_file());
+    }
 }

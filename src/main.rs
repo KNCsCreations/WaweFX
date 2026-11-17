@@ -18,8 +18,8 @@ fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("WaweFX")
-            .with_inner_size([800.0, 450.0])
-            .with_min_inner_size([660.0, 360.0])
+            .with_inner_size([840.0, 470.0])
+            .with_min_inner_size([720.0, 360.0])
             .with_icon(Arc::new(ui::build_window_icon())),
         ..Default::default()
     };

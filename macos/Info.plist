@@ -8,6 +8,8 @@
     <string>WaweFX</string>
     <key>CFBundleExecutable</key>
     <string>WaweFX</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.wawefx.soundboard</string>
     <key>CFBundleInfoDictionaryVersion</key>
