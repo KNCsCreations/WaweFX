@@ -36,6 +36,7 @@ pub struct SoundItem {
     pub image_path: Option<PathBuf>,
     pub duration_secs: f32,
     pub volume_trim: f32,
+    pub shortcut: Option<String>,
 }
 
 impl Default for SoundItem {
@@ -47,6 +48,7 @@ impl Default for SoundItem {
             image_path: None,
             duration_secs: 0.0,
             volume_trim: 1.0,
+            shortcut: None,
         }
     }
 }
@@ -66,6 +68,7 @@ impl SoundItem {
             image_path,
             duration_secs: duration_secs.max(0.0),
             volume_trim: 1.0,
+            shortcut: None,
         }
     }
 
@@ -284,6 +287,7 @@ pub fn rgb_to_color32(rgb: [u8; 3]) -> Color32 {
 pub struct AppConfig {
     pub sounds: Vec<SoundItem>,
     pub selected_sound_id: Option<String>,
+    pub stop_shortcut: Option<String>,
     pub audio: AudioRoutingConfig,
     pub theme: ThemeConfig,
 }
@@ -382,6 +386,79 @@ impl AppConfig {
         {
             self.selected_sound_id = self.sounds.first().map(|s| s.id.clone());
         }
+        self.stop_shortcut = self
+            .stop_shortcut
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        for sound in &mut self.sounds {
+            sound.shortcut = sound
+                .shortcut
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+        }
+    }
+
+    /// Returns a human-readable label of any conflicting sound or Stop-All binding for `shortcut`.
+    pub fn shortcut_conflict_label(
+        &self,
+        shortcut: &str,
+        ignore_sound_id: Option<&str>,
+        check_stop: bool,
+    ) -> Option<String> {
+        let target = crate::hotkeys::canonical_shortcut_key(shortcut)?;
+        for sound in &self.sounds {
+            if ignore_sound_id == Some(sound.id.as_str()) {
+                continue;
+            }
+            if let Some(ref existing) = sound.shortcut
+                && crate::hotkeys::canonical_shortcut_key(existing).as_deref() == Some(target.as_str())
+            {
+                return Some(format!("Sound '{}'", sound.title));
+            }
+        }
+        if check_stop
+            && let Some(ref stop_sc) = self.stop_shortcut
+            && crate::hotkeys::canonical_shortcut_key(stop_sc).as_deref() == Some(target.as_str())
+        {
+            return Some("Global Stop All Sounds".to_string());
+        }
+        None
+    }
+
+    /// Unbinds `shortcut` from any other sound pad (or `stop_shortcut` when `keep_stop` is false).
+    pub fn unbind_shortcut_conflicts(
+        &mut self,
+        shortcut: &str,
+        keep_sound_id: Option<&str>,
+        keep_stop: bool,
+    ) -> Vec<String> {
+        let Some(target) = crate::hotkeys::canonical_shortcut_key(shortcut) else {
+            return Vec::new();
+        };
+        let mut unbound = Vec::new();
+        for sound in &mut self.sounds {
+            if keep_sound_id == Some(sound.id.as_str()) {
+                continue;
+            }
+            if let Some(ref existing) = sound.shortcut
+                && crate::hotkeys::canonical_shortcut_key(existing).as_deref() == Some(target.as_str())
+            {
+                unbound.push(sound.title.clone());
+                sound.shortcut = None;
+            }
+        }
+        if !keep_stop
+            && let Some(ref stop_sc) = self.stop_shortcut
+            && crate::hotkeys::canonical_shortcut_key(stop_sc).as_deref() == Some(target.as_str())
+        {
+            unbound.push("Global Stop All Sounds".to_string());
+            self.stop_shortcut = None;
+        }
+        unbound
     }
 }
 
@@ -468,5 +545,40 @@ mod tests {
         cfg.save_to_path(&resolved).expect("save creates nested WaweFX config dir");
         assert!(resolved.exists());
         let _ = fs::remove_dir_all(&custom_base);
+    }
+
+    #[test]
+    fn shortcuts_load_from_legacy_json_and_unbind_conflicts() {
+        let legacy_json = r#"{
+            "sounds": [
+                {
+                    "id": "s1",
+                    "title": "Horn",
+                    "audio_path": "horn.wav",
+                    "duration_secs": 1.0,
+                    "volume_trim": 1.0
+                }
+            ]
+        }"#;
+        let parsed: AppConfig = serde_json::from_str(legacy_json).expect("legacy json parses");
+        assert_eq!(parsed.stop_shortcut, None);
+        assert_eq!(parsed.sounds[0].shortcut, None);
+
+        let mut cfg = AppConfig::default();
+        let mut s1 = SoundItem::new("Horn", PathBuf::from("a.wav"), None, 1.0);
+        s1.shortcut = Some("Ctrl+Shift+1".to_string());
+        let s2 = SoundItem::new("Bell", PathBuf::from("b.wav"), None, 1.0);
+        let s2_id = s2.id.clone();
+        cfg.sounds.push(s1);
+        cfg.sounds.push(s2);
+        cfg.stop_shortcut = Some("F9".to_string());
+
+        let unbound = cfg.unbind_shortcut_conflicts("ctrl+shift+1", Some(&s2_id), false);
+        assert_eq!(unbound, vec!["Horn".to_string()]);
+        assert_eq!(cfg.sounds[0].shortcut, None);
+
+        let unbound_stop = cfg.unbind_shortcut_conflicts("f9", Some(&s2_id), false);
+        assert_eq!(unbound_stop, vec!["Global Stop All Sounds".to_string()]);
+        assert_eq!(cfg.stop_shortcut, None);
     }
 }

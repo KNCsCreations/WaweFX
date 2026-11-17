@@ -7,6 +7,7 @@ use eframe::egui::{
 
 use crate::audio::AudioEngine;
 use crate::config::{AppConfig, SoundItem, rgb_to_color32};
+use crate::hotkeys;
 use crate::ui::ThumbnailLoader;
 
 /// User actions emitted by the soundboard pad grid.
@@ -15,6 +16,8 @@ pub struct GridAction {
     pub play_sound_id: Option<String>,
     pub stop_playback: bool,
     pub edit_sound_id: Option<String>,
+    pub assign_shortcut_id: Option<String>,
+    pub clear_shortcut_id: Option<String>,
     pub remove_sound_id: Option<String>,
     pub pad_rects: Vec<(String, Rect)>,
     pub config_dirty: bool,
@@ -169,10 +172,10 @@ pub fn render_sound_grid(
                             );
                         }
 
-                        // Active playing badge & live bottom progress bar
+                        // Active playing badge (top-left) & live bottom progress bar
                         if is_playing_this {
                             let badge_rect = Rect::from_min_size(
-                                Pos2::new(img_rect.max.x - 48.0, img_rect.min.y + 5.0),
+                                Pos2::new(img_rect.min.x + 5.0, img_rect.min.y + 5.0),
                                 Vec2::new(43.0, 16.0),
                             );
                             painter.rect_filled(badge_rect, CornerRadius::same(4), accent);
@@ -201,6 +204,35 @@ pub fn render_sound_grid(
                                 );
                                 painter.rect_filled(filled, CornerRadius::same(2), accent);
                             }
+                        }
+
+                        // Hotkey badge in the top-right corner of the card image
+                        if let Some(ref sc) = sound.shortcut {
+                            let label = hotkeys::badge_label(sc);
+                            let font = egui::FontId::monospace(9.5);
+                            let galley = painter.layout_no_wrap(label, font, Color32::WHITE);
+                            let max_w = (img_rect.width() - 10.0).max(28.0);
+                            let badge_w = (galley.size().x + 10.0).min(max_w);
+                            let badge_rect = Rect::from_min_size(
+                                Pos2::new(img_rect.max.x - badge_w - 5.0, img_rect.min.y + 5.0),
+                                Vec2::new(badge_w, 16.0),
+                            );
+                            painter.rect_filled(
+                                badge_rect,
+                                CornerRadius::same(4),
+                                Color32::from_rgba_unmultiplied(24, 28, 36, 210),
+                            );
+                            painter.rect_stroke(
+                                badge_rect,
+                                CornerRadius::same(4),
+                                Stroke::new(1.0_f32, Color32::from_white_alpha(70)),
+                                StrokeKind::Inside,
+                            );
+                            let text_pos = Pos2::new(
+                                badge_rect.center().x - galley.size().x * 0.5,
+                                badge_rect.center().y - galley.size().y * 0.5,
+                            );
+                            painter.galley(text_pos, galley, Color32::WHITE);
                         }
 
                         // Insertion indicator bar when dragging another pad over this pad
@@ -281,6 +313,14 @@ pub fn render_sound_grid(
                             }
                             if ui.button("Edit Sound (...)").clicked() {
                                 action.edit_sound_id = Some(sound.id.clone());
+                                ui.close_menu();
+                            }
+                            if ui.button("Record Shortcut...").clicked() {
+                                action.assign_shortcut_id = Some(sound.id.clone());
+                                ui.close_menu();
+                            }
+                            if sound.shortcut.is_some() && ui.button("Clear Shortcut").clicked() {
+                                action.clear_shortcut_id = Some(sound.id.clone());
                                 ui.close_menu();
                             }
                             ui.separator();

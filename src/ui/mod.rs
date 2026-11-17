@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::audio::{AudioDeviceList, AudioEngine};
 use crate::config::{AppConfig, SoundItem, rgb_to_color32};
+use crate::hotkeys::{HotkeyAction, HotkeyService};
 use crate::sync::{DesktopSyncNotice, SyncServerHandle};
 use crate::ui::modals::{ActiveModal, DriverSetupState, SoundModalDraft};
 
@@ -179,16 +180,24 @@ pub struct WaweFxApp {
     pub active_modal: Option<ActiveModal>,
     pub cached_devices: AudioDeviceList,
     pub driver_setup: DriverSetupState,
+    pub hotkeys: HotkeyService,
     pub local_ip: String,
     pub last_error: Option<String>,
     last_playback_state: (bool, Option<String>),
 }
 
 impl WaweFxApp {
-    pub fn new(config: AppConfig, audio: AudioEngine, sync: SyncServerHandle) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        config: AppConfig,
+        audio: AudioEngine,
+        sync: SyncServerHandle,
+    ) -> Self {
         let cached_devices = audio.available_devices();
         let local_ip = sync.local_ip();
         let last_playback_state = (audio.is_playing(), audio.active_sound_id());
+        let mut hotkeys = HotkeyService::new(ctx);
+        hotkeys.sync_bindings(&config);
 
         Self {
             config,
@@ -198,6 +207,7 @@ impl WaweFxApp {
             active_modal: None,
             cached_devices,
             driver_setup: DriverSetupState::default(),
+            hotkeys,
             local_ip,
             last_error: None,
             last_playback_state,
@@ -241,7 +251,18 @@ impl WaweFxApp {
             draft.title.trim().to_string()
         };
 
+        let normalized_shortcut = draft
+            .shortcut
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| crate::hotkeys::normalize_shortcut(s).unwrap_or_else(|_| s.to_string()));
+
         if let Some(edit_id) = draft.editing_id {
+            if let Some(ref sc) = normalized_shortcut {
+                self.config
+                    .unbind_shortcut_conflicts(sc, Some(&edit_id), false);
+            }
             if let Some(existing) = self.config.sounds.iter_mut().find(|s| s.id == edit_id) {
                 let audio_changed = existing.audio_path != audio_path;
                 let image_changed = existing.image_path != draft.image_path;
@@ -250,6 +271,7 @@ impl WaweFxApp {
                 existing.image_path = draft.image_path;
                 existing.duration_secs = draft.duration_secs;
                 existing.volume_trim = draft.volume_trim;
+                existing.shortcut = normalized_shortcut;
                 if audio_changed {
                     self.audio.invalidate_cached_sound(&edit_id);
                 }
@@ -259,15 +281,20 @@ impl WaweFxApp {
                 }
             }
         } else {
+            let new_id = Uuid::new_v4().to_string();
+            if let Some(ref sc) = normalized_shortcut {
+                self.config
+                    .unbind_shortcut_conflicts(sc, Some(&new_id), false);
+            }
             let new_item = SoundItem {
-                id: Uuid::new_v4().to_string(),
+                id: new_id.clone(),
                 title,
                 audio_path,
                 image_path: draft.image_path,
                 duration_secs: draft.duration_secs,
                 volume_trim: draft.volume_trim,
+                shortcut: normalized_shortcut,
             };
-            let new_id = new_item.id.clone();
             self.config.sounds.push(new_item);
             self.config.selected_sound_id = Some(new_id);
         }
@@ -281,6 +308,23 @@ impl eframe::App for WaweFxApp {
 
         let mut config_dirty = false;
         let mut sync_dirty = false;
+
+        self.hotkeys.sync_bindings(&self.config);
+        for hk_action in self.hotkeys.poll_triggered() {
+            match hk_action {
+                HotkeyAction::PlaySound(id) => {
+                    self.play_sound_by_id(&id);
+                    self.config.selected_sound_id = Some(id);
+                    sync_dirty = true;
+                    ctx.request_repaint();
+                }
+                HotkeyAction::StopAll => {
+                    self.audio.stop();
+                    sync_dirty = true;
+                    ctx.request_repaint();
+                }
+            }
+        }
 
         for notice in self.sync.poll_desktop_notices() {
             match notice {
@@ -301,8 +345,9 @@ impl eframe::App for WaweFxApp {
         }
 
         let status = self.audio.status_snapshot();
-        let show_alert_badge =
-            status.has_warning || !modals::has_virtual_audio_device(&self.cached_devices);
+        let show_alert_badge = status.has_warning
+            || !modals::has_virtual_audio_device(&self.cached_devices)
+            || !self.hotkeys.status().warnings.is_empty();
         let bg_toolbar = rgb_to_color32(self.config.theme.bg_toolbar);
         let bg_main = rgb_to_color32(self.config.theme.bg_main);
 
@@ -489,6 +534,20 @@ impl eframe::App for WaweFxApp {
         {
             self.active_modal = Some(ActiveModal::SoundEditor(SoundModalDraft::from_existing(item)));
         }
+        if let Some(assign_id) = grid_action.assign_shortcut_id
+            && let Some(item) = self.config.sounds.iter().find(|s| s.id == assign_id)
+        {
+            self.active_modal = Some(ActiveModal::SoundEditor(
+                SoundModalDraft::from_existing_recording_shortcut(item),
+            ));
+        }
+        if let Some(clear_id) = grid_action.clear_shortcut_id
+            && let Some(item) = self.config.sounds.iter_mut().find(|s| s.id == clear_id)
+        {
+            item.shortcut = None;
+            config_dirty = true;
+            sync_dirty = true;
+        }
         if let Some(remove_id) = grid_action.remove_sound_id {
             self.remove_sound_by_id(&remove_id);
             config_dirty = true;
@@ -508,6 +567,7 @@ impl eframe::App for WaweFxApp {
                 &mut modal_cfg,
                 &self.cached_devices,
                 &status,
+                self.hotkeys.status(),
                 &self.driver_setup,
                 &self.local_ip,
                 connected_clients,
@@ -517,6 +577,10 @@ impl eframe::App for WaweFxApp {
                 self.config = modal_cfg;
                 config_dirty = true;
                 sync_dirty = true;
+            }
+            if outcome.refresh_hotkey_permissions {
+                self.hotkeys.refresh_permissions();
+                self.hotkeys.sync_bindings(&self.config);
             }
 
             if outcome.refresh_and_apply_devices {
@@ -547,8 +611,11 @@ impl eframe::App for WaweFxApp {
             }
         }
 
-        if config_dirty && let Err(err) = self.config.save() {
-            self.last_error = Some(format!("Failed to save config: {err:#}"));
+        if config_dirty {
+            self.hotkeys.sync_bindings(&self.config);
+            if let Err(err) = self.config.save() {
+                self.last_error = Some(format!("Failed to save config: {err:#}"));
+            }
         }
 
         let current_playback = (self.audio.is_playing(), self.audio.active_sound_id());

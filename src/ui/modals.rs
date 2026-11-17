@@ -6,6 +6,7 @@ use qrcode::{Color as QrColor, QrCode};
 
 use crate::audio::{AudioDeviceList, AudioEngine, AudioEngineStatus, apo_installer};
 use crate::config::{AppConfig, SoundItem, ThemePreset};
+use crate::hotkeys::{self, HotkeyStatus, ShortcutCapture};
 
 #[cfg(target_os = "windows")]
 const VBCABLE_ZIP_URL: &str =
@@ -137,6 +138,10 @@ pub struct SoundModalDraft {
     pub image_path: Option<PathBuf>,
     pub duration_secs: f32,
     pub volume_trim: f32,
+    pub shortcut: Option<String>,
+    pub shortcut_input: String,
+    pub recording_shortcut: bool,
+    pub shortcut_conflict_notice: Option<String>,
     pub error_message: Option<String>,
 }
 
@@ -149,6 +154,10 @@ impl SoundModalDraft {
             image_path: None,
             duration_secs: 0.0,
             volume_trim: 1.0,
+            shortcut: None,
+            shortcut_input: String::new(),
+            recording_shortcut: false,
+            shortcut_conflict_notice: None,
             error_message: None,
         }
     }
@@ -161,8 +170,18 @@ impl SoundModalDraft {
             image_path: item.image_path.clone(),
             duration_secs: item.duration_secs,
             volume_trim: item.volume_trim,
+            shortcut: item.shortcut.clone(),
+            shortcut_input: item.shortcut.clone().unwrap_or_default(),
+            recording_shortcut: false,
+            shortcut_conflict_notice: None,
             error_message: None,
         }
+    }
+
+    pub fn from_existing_recording_shortcut(item: &SoundItem) -> Self {
+        let mut draft = Self::from_existing(item);
+        draft.recording_shortcut = true;
+        draft
     }
 }
 
@@ -173,6 +192,7 @@ pub struct ModalOutcome {
     pub save_sound: Option<SoundModalDraft>,
     pub apply_audio_config: bool,
     pub refresh_and_apply_devices: bool,
+    pub refresh_hotkey_permissions: bool,
     pub open_settings: bool,
     pub config_dirty: bool,
 }
@@ -185,6 +205,7 @@ pub fn render_modals(
     config: &mut AppConfig,
     devices: &AudioDeviceList,
     status: &AudioEngineStatus,
+    hotkey_status: &HotkeyStatus,
     driver_setup: &DriverSetupState,
     local_ip: &str,
     connected_clients: usize,
@@ -193,13 +214,13 @@ pub fn render_modals(
 
     match modal {
         ActiveModal::SoundEditor(draft) => {
-            render_sound_editor_modal(ctx, draft, &mut outcome);
+            render_sound_editor_modal(ctx, draft, config, &mut outcome);
         }
         ActiveModal::Settings => {
             render_settings_modal(ctx, config, devices, driver_setup, &mut outcome);
         }
         ActiveModal::Alerts => {
-            render_alerts_modal(ctx, status, devices, driver_setup, &mut outcome);
+            render_alerts_modal(ctx, status, hotkey_status, devices, driver_setup, &mut outcome);
         }
         ActiveModal::CompanionPairing => {
             render_companion_modal(ctx, config.audio.sync_port, local_ip, connected_clients, &mut outcome);
@@ -212,6 +233,7 @@ pub fn render_modals(
 fn render_sound_editor_modal(
     ctx: &egui::Context,
     draft: &mut SoundModalDraft,
+    config: &AppConfig,
     outcome: &mut ModalOutcome,
 ) {
     let title = if draft.editing_id.is_some() {
@@ -226,7 +248,7 @@ fn render_sound_editor_modal(
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .fixed_size(Vec2::new(430.0, 265.0))
+        .fixed_size(Vec2::new(455.0, 325.0))
         .show(ctx, |ui| {
             ui.add_space(4.0);
             egui::Grid::new("sound_editor_grid")
@@ -237,7 +259,7 @@ fn render_sound_editor_modal(
                     ui.add(
                         egui::TextEdit::singleline(&mut draft.title)
                             .hint_text("Sound name...")
-                            .desired_width(275.0),
+                            .desired_width(295.0),
                     );
                     ui.end_row();
 
@@ -314,6 +336,33 @@ fn render_sound_editor_modal(
                     });
                     ui.end_row();
 
+                    ui.label("Shortcut:");
+                    let mut sc_err: Option<String> = None;
+                    let shortcut_changed = render_shortcut_picker(
+                        ctx,
+                        ui,
+                        egui::Id::new("sound_editor_shortcut"),
+                        &mut draft.shortcut_input,
+                        &mut draft.shortcut,
+                        &mut draft.recording_shortcut,
+                        &mut sc_err,
+                    );
+                    if let Some(err) = sc_err {
+                        draft.error_message = Some(err);
+                    } else if shortcut_changed {
+                        draft.error_message = None;
+                        draft.shortcut_conflict_notice = draft.shortcut.as_deref().and_then(|sc| {
+                            config
+                                .shortcut_conflict_label(sc, draft.editing_id.as_deref(), true)
+                                .map(|owner| {
+                                    format!(
+                                        "Note: '{sc}' is currently assigned to {owner} and will be reassigned on save."
+                                    )
+                                })
+                        });
+                    }
+                    ui.end_row();
+
                     ui.label("Duration:");
                     let mins = (draft.duration_secs.round() as u32) / 60;
                     let secs = (draft.duration_secs.round() as u32) % 60;
@@ -321,8 +370,13 @@ fn render_sound_editor_modal(
                     ui.end_row();
                 });
 
+            if let Some(notice) = &draft.shortcut_conflict_notice {
+                ui.add_space(4.0);
+                ui.colored_label(Color32::from_rgb(235, 140, 50), notice);
+            }
+
             if let Some(err) = &draft.error_message {
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.colored_label(Color32::from_rgb(220, 70, 70), err);
             }
 
@@ -333,7 +387,9 @@ fn render_sound_editor_modal(
                     outcome.close_modal = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let can_save = draft.audio_path.is_some();
+                    let shortcut_valid = draft.shortcut_input.trim().is_empty()
+                        || hotkeys::parse_shortcut(&draft.shortcut_input).is_ok();
+                    let can_save = draft.audio_path.is_some() && shortcut_valid;
                     if ui
                         .add_enabled(can_save, egui::Button::new("Save Sound"))
                         .clicked()
@@ -348,6 +404,89 @@ fn render_sound_editor_modal(
     if !open {
         outcome.close_modal = true;
     }
+}
+
+fn render_shortcut_picker(
+    ctx: &egui::Context,
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    shortcut_input: &mut String,
+    shortcut_value: &mut Option<String>,
+    recording: &mut bool,
+    validation_error: &mut Option<String>,
+) -> bool {
+    let mut changed = false;
+
+    if *recording {
+        match hotkeys::capture_egui_shortcut(ctx) {
+            ShortcutCapture::Captured(captured) => {
+                *recording = false;
+                *shortcut_input = captured.clone();
+                *shortcut_value = Some(captured);
+                *validation_error = None;
+                changed = true;
+            }
+            ShortcutCapture::Cancelled => {
+                *recording = false;
+            }
+            ShortcutCapture::Idle => {}
+        }
+    }
+
+    ui.horizontal(|ui| {
+        if *recording {
+            let coral = Color32::from_rgb(235, 110, 60);
+            ui.colored_label(coral, egui::RichText::new("Press keys... (Esc cancels)").strong());
+            if ui.button("Cancel").clicked() {
+                *recording = false;
+            }
+        } else {
+            let resp = ui.add(
+                egui::TextEdit::singleline(shortcut_input)
+                    .id(id)
+                    .desired_width(128.0)
+                    .hint_text("Ctrl+1 / F9 / Numpad1"),
+            );
+            if resp.changed() {
+                let trimmed = shortcut_input.trim();
+                if trimmed.is_empty() {
+                    *shortcut_value = None;
+                    *validation_error = None;
+                    changed = true;
+                } else {
+                    match hotkeys::normalize_shortcut(trimmed) {
+                        Ok(normalized) => {
+                            *shortcut_value = Some(normalized);
+                            *validation_error = None;
+                            changed = true;
+                        }
+                        Err(err) => {
+                            *validation_error = Some(err);
+                        }
+                    }
+                }
+            }
+            if ui.button("Record Shortcut").clicked() {
+                *recording = true;
+                if let Some(focused) = ctx.memory(|m| m.focused()) {
+                    ctx.memory_mut(|m| m.surrender_focus(focused));
+                }
+            }
+            let has_shortcut = !shortcut_input.trim().is_empty() || shortcut_value.is_some();
+            if ui
+                .add_enabled(has_shortcut, egui::Button::new("X"))
+                .on_hover_text("Clear shortcut")
+                .clicked()
+            {
+                shortcut_input.clear();
+                *shortcut_value = None;
+                *validation_error = None;
+                changed = true;
+            }
+        }
+    });
+
+    changed
 }
 
 fn render_settings_modal(
@@ -514,7 +653,82 @@ fn render_settings_modal(
                 ui.separator();
                 ui.add_space(6.0);
 
-                // --- Section 2: Color Themes (3 Presets + Custom RGB Pickers) ---
+                // --- Section 2: Global Hotkeys (Stop All Sounds) ---
+                ui.heading("Global Hotkeys");
+                ui.add_space(4.0);
+
+                let stop_rec_key = egui::Id::new("wawefx_stop_hotkey_recording");
+                let stop_input_key = egui::Id::new("wawefx_stop_hotkey_input_buf");
+                let stop_err_key = egui::Id::new("wawefx_stop_hotkey_err");
+                let stop_note_key = egui::Id::new("wawefx_stop_hotkey_note");
+
+                let mut recording_stop: bool = ctx.data_mut(|d| d.get_temp(stop_rec_key).unwrap_or(false));
+                let mut stop_input: String = ctx.data_mut(|d| {
+                    d.get_temp(stop_input_key)
+                        .unwrap_or_else(|| config.stop_shortcut.clone().unwrap_or_default())
+                });
+                let mut stop_err: Option<String> = ctx.data_mut(|d| d.get_temp(stop_err_key).unwrap_or(None));
+                let mut stop_note: Option<String> = ctx.data_mut(|d| d.get_temp(stop_note_key).unwrap_or(None));
+
+                // Keep buffer synced when stop_shortcut was cleared externally by a sound shortcut conflict
+                if !recording_stop
+                    && stop_err.is_none()
+                    && config.stop_shortcut.as_deref() != Some(stop_input.trim())
+                    && (config.stop_shortcut.is_none() && !stop_input.is_empty() && hotkeys::parse_shortcut(&stop_input).is_ok()
+                        || config.stop_shortcut.is_some() && stop_input.is_empty())
+                {
+                    stop_input = config.stop_shortcut.clone().unwrap_or_default();
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Stop All Sounds:");
+                    let mut stop_val = config.stop_shortcut.clone();
+                    if render_shortcut_picker(
+                        ctx,
+                        ui,
+                        egui::Id::new("settings_stop_shortcut"),
+                        &mut stop_input,
+                        &mut stop_val,
+                        &mut recording_stop,
+                        &mut stop_err,
+                    ) {
+                        config.stop_shortcut = stop_val.clone();
+                        stop_note = if let Some(ref sc) = stop_val {
+                            let unbound = config.unbind_shortcut_conflicts(sc, None, true);
+                            if unbound.is_empty() {
+                                None
+                            } else {
+                                Some(format!(
+                                    "Unbound '{sc}' from: {}.",
+                                    unbound.join(", ")
+                                ))
+                            }
+                        } else {
+                            None
+                        };
+                        outcome.config_dirty = true;
+                    }
+                });
+                if let Some(ref note) = stop_note {
+                    ui.colored_label(Color32::from_rgb(235, 140, 50), note);
+                }
+                if let Some(ref err) = stop_err {
+                    ui.colored_label(Color32::from_rgb(220, 70, 70), err);
+                }
+                ui.small("Trigger any assigned sound pad or Stop All from anywhere on your system (e.g. Ctrl+Shift+1, F9, Numpad0).");
+
+                ctx.data_mut(|d| {
+                    d.insert_temp(stop_rec_key, recording_stop);
+                    d.insert_temp(stop_input_key, stop_input);
+                    d.insert_temp(stop_err_key, stop_err);
+                    d.insert_temp(stop_note_key, stop_note);
+                });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // --- Section 3: Color Themes (3 Presets + Custom RGB Pickers) ---
                 ui.heading("Theme & Colors");
                 ui.add_space(4.0);
 
@@ -623,18 +837,22 @@ fn color_row(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
 fn render_alerts_modal(
     ctx: &egui::Context,
     status: &AudioEngineStatus,
+    hotkey_status: &HotkeyStatus,
     devices: &AudioDeviceList,
     driver_setup: &DriverSetupState,
     outcome: &mut ModalOutcome,
 ) {
     let mut open = true;
     let missing_virtual_driver = !has_virtual_audio_device(devices);
+    let has_any_warning = !status.warnings.is_empty()
+        || !hotkey_status.warnings.is_empty()
+        || missing_virtual_driver;
     egui::Window::new("Audio Engine Status & Alerts")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .default_size(Vec2::new(500.0, if missing_virtual_driver { 410.0 } else { 315.0 }))
+        .default_size(Vec2::new(510.0, if missing_virtual_driver { 440.0 } else { 350.0 }))
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if missing_virtual_driver {
@@ -668,14 +886,41 @@ fn render_alerts_modal(
                     status.measured_mic_in_fps,
                     status.measured_vmic_out_fps
                 ));
+                ui.label(format!(
+                    "Global Hotkeys: {} ({} active)",
+                    if hotkey_status.manager_ready { "Active" } else { "Unavailable" },
+                    hotkey_status.registered_count
+                ));
+
+                if let Some(trusted) = hotkey_status.macos_accessibility_trusted {
+                    ui.horizontal(|ui| {
+                        if trusted {
+                            ui.colored_label(
+                                Color32::from_rgb(46, 160, 67),
+                                "macOS Accessibility Permission: Granted",
+                            );
+                        } else {
+                            ui.colored_label(
+                                Color32::from_rgb(235, 110, 60),
+                                "macOS Accessibility Permission: Required for global hotkeys",
+                            );
+                            if ui.button("Open Accessibility Settings").clicked() {
+                                hotkeys::open_macos_accessibility_settings();
+                            }
+                            if ui.button("Recheck").clicked() {
+                                outcome.refresh_hotkey_permissions = true;
+                            }
+                        }
+                    });
+                }
 
                 ui.add_space(8.0);
                 ui.separator();
 
-                if status.warnings.is_empty() && !missing_virtual_driver {
+                if !has_any_warning {
                     ui.colored_label(
                         Color32::from_rgb(46, 160, 67),
-                        "All active audio streams are running normally.",
+                        "All active audio streams and global hotkeys are running normally.",
                     );
                 } else {
                     ui.label(egui::RichText::new("Warnings:").strong());
@@ -686,6 +931,9 @@ fn render_alerts_modal(
                         );
                     }
                     for warning in &status.warnings {
+                        ui.colored_label(Color32::from_rgb(235, 110, 60), format!("• {warning}"));
+                    }
+                    for warning in &hotkey_status.warnings {
                         ui.colored_label(Color32::from_rgb(235, 110, 60), format!("• {warning}"));
                     }
                 }

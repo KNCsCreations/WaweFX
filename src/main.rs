@@ -1,5 +1,8 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 pub mod audio;
 pub mod config;
+pub mod hotkeys;
 pub mod sync;
 pub mod ui;
 
@@ -24,8 +27,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "WaweFX",
         native_options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
             Ok(Box::new(ui::WaweFxApp::new(
+                &cc.egui_ctx,
                 cfg,
                 audio_engine,
                 sync_handle,
