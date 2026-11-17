@@ -822,16 +822,16 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
 <title>WaweFX Remote</title>
 <style>
   :root {
-    --bg-main: #D8BFD8;
-    --bg-toolbar: #D8BFD8;
-    --toolbar-divider: #000000;
-    --icon-primary: #4A5568;
-    --icon-secondary: #3E4656;
-    --gauge-track: #708090;
-    --accent: #FF7F50;
-    --pad-bg: #C8ADC8;
-    --pad-hover: #BFA0BF;
-    --pad-text: #2D3748;
+    --bg-main: #F4EFE6;
+    --bg-toolbar: #EAE2D3;
+    --toolbar-divider: #CFC3B0;
+    --icon-primary: #2B2520;
+    --icon-secondary: #7A6F64;
+    --gauge-track: #7A6F64;
+    --accent: #B08968;
+    --pad-bg: #EAE2D3;
+    --pad-hover: #DFD5C3;
+    --pad-text: #2B2520;
   }
   * {
     box-sizing: border-box;
@@ -1639,7 +1639,9 @@ mod tests {
         });
         let list_json = serde_json::to_string(&list_ev).unwrap();
         assert!(list_json.contains(r#""type":"SoundsListUpdated""#));
-        assert!(list_json.contains(r##""bg_main":"#D8BFD8""##));
+        assert!(list_json.contains(r##""bg_main":"#F4EFE6""##));
+        assert!(list_json.contains(r##""pad_card_bg":"#EAE2D3""##));
+        assert!(list_json.contains(r##""accent_color":"#B08968""##));
 
         let tick_ev = SyncEvent::PlaybackTick(PlaybackTickPayload {
             active_sound_id: Some("1".to_string()),

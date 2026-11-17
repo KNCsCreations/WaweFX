@@ -118,7 +118,7 @@ impl Default for AudioRoutingConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ThemePreset {
     #[default]
-    ClassicLilac,
+    WarmBeige,
     MidnightDark,
     NordFrost,
     Custom,
@@ -127,7 +127,7 @@ pub enum ThemePreset {
 impl ThemePreset {
     /// The 3 built-in presets displayed in the Settings theme selector.
     pub const BUILTIN_PRESETS: [ThemePreset; 3] = [
-        ThemePreset::ClassicLilac,
+        ThemePreset::WarmBeige,
         ThemePreset::MidnightDark,
         ThemePreset::NordFrost,
     ];
@@ -135,7 +135,7 @@ impl ThemePreset {
     /// Human-readable display label for the Settings UI.
     pub fn label(self) -> &'static str {
         match self {
-            ThemePreset::ClassicLilac => "Classic WaweFX Lilac",
+            ThemePreset::WarmBeige => "Warm Beige",
             ThemePreset::MidnightDark => "Midnight Dark",
             ThemePreset::NordFrost => "Nord Frost",
             ThemePreset::Custom => "Custom",
@@ -164,27 +164,27 @@ pub struct ThemeConfig {
 
 impl Default for ThemeConfig {
     fn default() -> Self {
-        Self::classic_lilac()
+        Self::warm_beige()
     }
 }
 
 impl ThemeConfig {
-    /// Exact default palette matching the reference WaweFX UI screenshot (`#D8BFD8`, `#4A5568`, `#708090`, `#FF7F50`).
-    pub fn classic_lilac() -> Self {
+    /// Cohesive warm cream and sandstone beige palette (`#F4EFE6`, `#EAE2D3`, `#B08968`, `#2B2520`).
+    pub fn warm_beige() -> Self {
         Self {
-            preset: ThemePreset::ClassicLilac,
-            bg_main: [0xD8, 0xBF, 0xD8],
-            bg_toolbar: [0xD8, 0xBF, 0xD8],
-            toolbar_divider: [0x00, 0x00, 0x00],
-            toolbar_shadow: [0x64, 0x64, 0x64],
-            icon_primary: [0x4A, 0x55, 0x68],
-            icon_secondary: [0x3E, 0x46, 0x56],
-            icon_phone: [0x37, 0x41, 0x51],
-            gauge_and_track: [0x70, 0x80, 0x90],
-            accent_color: [0xFF, 0x7F, 0x50],
-            pad_card_bg: [0xC8, 0xAD, 0xC8],
-            pad_card_hover: [0xBF, 0xA0, 0xBF],
-            pad_text: [0x2D, 0x37, 0x48],
+            preset: ThemePreset::WarmBeige,
+            bg_main: [0xF4, 0xEF, 0xE6],
+            bg_toolbar: [0xEA, 0xE2, 0xD3],
+            toolbar_divider: [0xCF, 0xC3, 0xB0],
+            toolbar_shadow: [0xC4, 0xB6, 0xA0],
+            icon_primary: [0x2B, 0x25, 0x20],
+            icon_secondary: [0x7A, 0x6F, 0x64],
+            icon_phone: [0x2B, 0x25, 0x20],
+            gauge_and_track: [0x7A, 0x6F, 0x64],
+            accent_color: [0xB0, 0x89, 0x68],
+            pad_card_bg: [0xEA, 0xE2, 0xD3],
+            pad_card_hover: [0xDF, 0xD5, 0xC3],
+            pad_text: [0x2B, 0x25, 0x20],
         }
     }
 
@@ -229,11 +229,11 @@ impl ThemeConfig {
     /// Constructs a [`ThemeConfig`] from a [`ThemePreset`].
     pub fn from_preset(preset: ThemePreset) -> Self {
         match preset {
-            ThemePreset::ClassicLilac => Self::classic_lilac(),
+            ThemePreset::WarmBeige => Self::warm_beige(),
             ThemePreset::MidnightDark => Self::midnight_dark(),
             ThemePreset::NordFrost => Self::nord_frost(),
             ThemePreset::Custom => {
-                let mut custom = Self::classic_lilac();
+                let mut custom = Self::warm_beige();
                 custom.preset = ThemePreset::Custom;
                 custom
             }
@@ -467,18 +467,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_theme_matches_reference_screenshot_colors() {
+    fn default_theme_is_warm_beige() {
         let theme = ThemeConfig::default();
-        assert_eq!(theme.preset, ThemePreset::ClassicLilac);
-        assert_eq!(theme.bg_main, [0xD8, 0xBF, 0xD8]);
-        assert_eq!(theme.bg_toolbar, [0xD8, 0xBF, 0xD8]);
-        assert_eq!(theme.toolbar_divider, [0x00, 0x00, 0x00]);
-        assert_eq!(theme.icon_primary, [0x4A, 0x55, 0x68]);
-        assert_eq!(theme.gauge_and_track, [0x70, 0x80, 0x90]);
-        assert_eq!(theme.accent_color, [0xFF, 0x7F, 0x50]);
+        assert_eq!(theme.preset, ThemePreset::WarmBeige);
+        assert_eq!(theme.bg_main, [0xF4, 0xEF, 0xE6]);
+        assert_eq!(theme.bg_toolbar, [0xEA, 0xE2, 0xD3]);
+        assert_eq!(theme.pad_card_bg, [0xEA, 0xE2, 0xD3]);
+        assert_eq!(theme.toolbar_divider, [0xCF, 0xC3, 0xB0]);
+        assert_eq!(theme.icon_primary, [0x2B, 0x25, 0x20]);
+        assert_eq!(theme.pad_text, [0x2B, 0x25, 0x20]);
+        assert_eq!(theme.gauge_and_track, [0x7A, 0x6F, 0x64]);
+        assert_eq!(theme.accent_color, [0xB0, 0x89, 0x68]);
         assert_eq!(
             rgb_to_color32(theme.accent_color),
-            Color32::from_rgb(0xFF, 0x7F, 0x50)
+            Color32::from_rgb(0xB0, 0x89, 0x68)
         );
     }
 

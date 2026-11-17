@@ -767,7 +767,7 @@ fn render_settings_modal(
                         color_changed |= color_row(ui, "Knobs & Track", &mut config.theme.gauge_and_track);
                         ui.end_row();
 
-                        color_changed |= color_row(ui, "Accent / Coral", &mut config.theme.accent_color);
+                        color_changed |= color_row(ui, "Primary Accent", &mut config.theme.accent_color);
                         color_changed |= color_row(ui, "Pad Surface", &mut config.theme.pad_card_bg);
                         ui.end_row();
 
@@ -783,8 +783,8 @@ fn render_settings_modal(
 
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Reset to Classic WaweFX").clicked() {
-                        config.theme.apply_preset(ThemePreset::ClassicLilac);
+                    if ui.button("Reset to Warm Beige").clicked() {
+                        config.theme.apply_preset(ThemePreset::WarmBeige);
                         outcome.config_dirty = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

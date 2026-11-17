@@ -141,9 +141,9 @@ fn decode_thumbnail_image(path: &Path) -> Option<ColorImage> {
 pub fn build_window_icon() -> egui::IconData {
     let size = 32usize;
     let mut rgba = vec![0u8; size * size * 4];
-    let bg = [0xD8u8, 0xBF, 0xD8, 0xFF];
-    let fg = [0x37u8, 0x41, 0x51, 0xFF];
-    let accent = [0xFFu8, 0x7F, 0x50, 0xFF];
+    let bg = [0xF4u8, 0xEF, 0xE6, 0xFF];
+    let fg = [0x2Bu8, 0x25, 0x20, 0xFF];
+    let accent = [0xB0u8, 0x89, 0x68, 0xFF];
 
     for y in 0..size {
         for x in 0..size {
