@@ -49,7 +49,7 @@ pub fn render_toolbar(
     let text_color = rgb_to_color32(theme.pad_text);
 
     let avail = ui.available_rect_before_wrap();
-    let bar_rect = Rect::from_min_size(avail.min, Vec2::new(avail.width().max(680.0), TOOLBAR_HEIGHT));
+    let bar_rect = Rect::from_min_size(avail.min, Vec2::new(avail.width().max(640.0), TOOLBAR_HEIGHT));
     ui.allocate_rect(bar_rect, Sense::hover());
 
     let x0 = bar_rect.min.x;
@@ -57,21 +57,8 @@ pub fn render_toolbar(
     let has_selection = config.selected_sound_id.is_some();
     let is_playing = audio.is_playing();
 
-    // --- Top-Left Header Title ---
-    ui.painter().text(
-        Pos2::new(x0 + 12.0, y0 + 22.5),
-        egui::Align2::LEFT_CENTER,
-        "WaweFX",
-        egui::FontId::proportional(14.5),
-        text_color,
-    );
-    ui.painter().line_segment(
-        [Pos2::new(x0 + 75.0, y0 + 11.0), Pos2::new(x0 + 75.0, y0 + 34.0)],
-        Stroke::new(1.0_f32, Color32::from_black_alpha(38)),
-    );
-
     // --- Left Group: Soundboard CRUD (`+`, `-`, `...`) ---
-    let add_rect = Rect::from_min_size(Pos2::new(x0 + 84.0, y0 + 10.0), Vec2::splat(25.0));
+    let add_rect = Rect::from_min_size(Pos2::new(x0 + 10.0, y0 + 10.0), Vec2::splat(25.0));
     if paint_circle_icon_button(ui, "tb_add", add_rect, icon_primary, bg_toolbar, "Add Sound (+)", |p, c, bg| {
         p.circle_filled(c, 12.5, icon_primary);
         p.line_segment([Pos2::new(c.x - 5.5, c.y), Pos2::new(c.x + 5.5, c.y)], Stroke::new(2.6_f32, bg));
@@ -80,7 +67,7 @@ pub fn render_toolbar(
         action.add_sound = true;
     }
 
-    let remove_rect = Rect::from_min_size(Pos2::new(x0 + 114.0, y0 + 10.0), Vec2::splat(25.0));
+    let remove_rect = Rect::from_min_size(Pos2::new(x0 + 41.0, y0 + 10.0), Vec2::splat(25.0));
     let remove_col = if has_selection { icon_primary } else { dim_color(icon_primary, 0.55) };
     if paint_circle_icon_button(
         ui,
@@ -98,7 +85,7 @@ pub fn render_toolbar(
         action.remove_selected = true;
     }
 
-    let edit_rect = Rect::from_min_size(Pos2::new(x0 + 144.0, y0 + 10.0), Vec2::splat(25.0));
+    let edit_rect = Rect::from_min_size(Pos2::new(x0 + 72.0, y0 + 10.0), Vec2::splat(25.0));
     let edit_col = if has_selection { icon_primary } else { dim_color(icon_primary, 0.55) };
     if paint_circle_icon_button(
         ui,
@@ -119,7 +106,7 @@ pub fn render_toolbar(
     }
 
     // --- Transport Controls (`Play`, `Stop`, `Rewind`, `FastForward`) ---
-    let play_rect = Rect::from_min_size(Pos2::new(x0 + 184.0, y0 + 10.0), Vec2::splat(25.0));
+    let play_rect = Rect::from_min_size(Pos2::new(x0 + 118.0, y0 + 10.0), Vec2::splat(25.0));
     let play_fill = if is_playing { accent } else { icon_primary };
     if paint_circle_icon_button(ui, "tb_play", play_rect, play_fill, bg_toolbar, "Play Selected Sound", |p, c, bg| {
         p.circle_filled(c, 12.5, play_fill);
@@ -133,7 +120,7 @@ pub fn render_toolbar(
         action.play_selected = true;
     }
 
-    let stop_rect = Rect::from_min_size(Pos2::new(x0 + 214.0, y0 + 10.0), Vec2::splat(25.0));
+    let stop_rect = Rect::from_min_size(Pos2::new(x0 + 149.0, y0 + 10.0), Vec2::splat(25.0));
     if paint_circle_icon_button(ui, "tb_stop", stop_rect, icon_primary, bg_toolbar, "Stop Playback", |p, c, bg| {
         p.circle_filled(c, 12.5, icon_primary);
         let sq = Rect::from_center_size(c, Vec2::splat(9.0));
@@ -142,22 +129,22 @@ pub fn render_toolbar(
         action.stop_playback = true;
     }
 
-    let rw_rect = Rect::from_min_size(Pos2::new(x0 + 244.0, y0 + 14.0), Vec2::new(25.0, 17.0));
+    let rw_rect = Rect::from_min_size(Pos2::new(x0 + 180.0, y0 + 14.0), Vec2::new(25.0, 17.0));
     if paint_double_arrow_button(ui, "tb_rw", rw_rect, icon_secondary, true, "Rewind (-5s)") {
         action.rewind = true;
     }
 
-    let ff_rect = Rect::from_min_size(Pos2::new(x0 + 274.0, y0 + 14.0), Vec2::new(25.0, 17.0));
+    let ff_rect = Rect::from_min_size(Pos2::new(x0 + 211.0, y0 + 14.0), Vec2::new(25.0, 17.0));
     if paint_double_arrow_button(ui, "tb_ff", ff_rect, icon_secondary, false, "Fast Forward (+5s)") {
         action.fast_forward = true;
     }
 
     // --- Right Cluster Anchor ---
-    let right_base = (bar_rect.max.x - 238.0).max(x0 + 385.0);
+    let right_base = (bar_rect.max.x - 240.0).max(x0 + 280.0);
 
     // --- Center Horizontal Timeline / Seek Bar ---
-    let slider_left = (x0 + 314.0).min(right_base - 80.0);
-    let slider_right = (right_base - 32.0).max(slider_left + 60.0);
+    let slider_left = (x0 + 275.0).min(right_base - 95.0);
+    let slider_right = (right_base - 35.0).max(slider_left + 60.0);
     let slider_rect = Rect::from_min_max(
         Pos2::new(slider_left, y0 + 15.0),
         Pos2::new(slider_right, y0 + 31.0),
@@ -375,21 +362,67 @@ fn paint_timeline_seek_bar(
     let track_max_x = (rect.max.x - thumb_r).max(track_min_x + 1.0);
     let cy = rect.center().y;
 
-    let mut progress = if is_playing {
+    #[derive(Clone, Copy, Default)]
+    struct TimelineScrubState {
+        active: bool,
+        was_playing: bool,
+        target_progress: f32,
+    }
+
+    let scrub_key = egui::Id::new("tb_timeline_scrub_state");
+    let mut scrub: TimelineScrubState = ui.data(|d| d.get_temp(scrub_key)).unwrap_or_default();
+    let pointer_to_progress = |px: f32| ((px - track_min_x) / (track_max_x - track_min_x)).clamp(0.0, 1.0);
+
+    let live_progress = if is_playing {
         audio.playback_progress().clamp(0.0, 1.0)
     } else {
         0.0
     };
+    let mut progress = live_progress;
 
-    if (resp.dragged() || resp.clicked())
+    if resp.drag_started() {
+        let t = resp
+            .interact_pointer_pos()
+            .map(|p| pointer_to_progress(p.x))
+            .unwrap_or(live_progress);
+        scrub = TimelineScrubState {
+            active: true,
+            was_playing: is_playing,
+            target_progress: t,
+        };
+        if is_playing {
+            audio.set_scrub_paused(true);
+            progress = t;
+        }
+    } else if scrub.active && resp.dragged() {
+        if let Some(pointer) = resp.interact_pointer_pos() {
+            scrub.target_progress = pointer_to_progress(pointer.x);
+        }
+        if scrub.was_playing {
+            progress = scrub.target_progress;
+        }
+    } else if scrub.active && (resp.drag_stopped() || !resp.dragged()) {
+        if let Some(pointer) = resp.interact_pointer_pos() {
+            scrub.target_progress = pointer_to_progress(pointer.x);
+        }
+        if scrub.was_playing && audio.is_playing() {
+            audio.seek_to_progress(scrub.target_progress);
+            progress = scrub.target_progress;
+            seeked = true;
+        }
+        audio.set_scrub_paused(false);
+        scrub = TimelineScrubState::default();
+    } else if resp.clicked()
         && is_playing
         && let Some(pointer) = resp.interact_pointer_pos()
     {
-        let t = ((pointer.x - track_min_x) / (track_max_x - track_min_x)).clamp(0.0, 1.0);
+        let t = pointer_to_progress(pointer.x);
         audio.seek_to_progress(t);
         progress = t;
         seeked = true;
     }
+
+    ui.data_mut(|d| d.insert_temp(scrub_key, scrub));
 
     let thumb_x = track_min_x + progress * (track_max_x - track_min_x);
     let thumb_center = Pos2::new(thumb_x, cy);

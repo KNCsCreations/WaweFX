@@ -724,9 +724,32 @@ fn is_image_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::Cursor;
     use std::path::Path;
 
+    use image::codecs::ico::{IcoDecoder, IcoEncoder, IcoFrame};
+    use image::codecs::png::PngEncoder;
+    use image::imageops::FilterType;
+    use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, Rgba, RgbaImage};
+
     use super::{LOGO_PNG_BYTES, build_window_icon};
+
+    fn rounded_rect_coverage(px: u32, py: u32, size: u32, radius: f32) -> f32 {
+        let half = size as f32 * 0.5;
+        let dx = (px as f32 + 0.5 - half).abs() - (half - radius);
+        let dy = (py as f32 + 0.5 - half).abs() - (half - radius);
+        let dist = dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0) - radius;
+        (0.5 - dist / 1.2).clamp(0.0, 1.0)
+    }
+
+    fn write_rgba8_png(path: &Path, rgba: &RgbaImage) {
+        let mut out = Vec::new();
+        PngEncoder::new(&mut out)
+            .write_image(rgba.as_raw(), rgba.width(), rgba.height(), ExtendedColorType::Rgba8)
+            .expect("encode Rgba8 PNG");
+        fs::write(path, &out).expect("write PNG file");
+    }
 
     #[test]
     fn decodes_embedded_logo_and_platform_icon_assets_exist() {
@@ -735,8 +758,158 @@ mod tests {
         assert_eq!(icon.height, 256);
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
         assert_eq!(&icon.rgba[0..4], &[0, 0, 0, 0]);
+        let center_off = (128 * 256 + 128) * 4;
+        assert_eq!(icon.rgba[center_off + 3], 255);
         assert!(LOGO_PNG_BYTES.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let logo_img = image::load_from_memory(LOGO_PNG_BYTES).expect("decode logo.png");
+        assert_eq!(logo_img.color(), image::ColorType::Rgba8);
+        let logo_rgba = logo_img.to_rgba8();
+        assert_eq!(logo_rgba.get_pixel(0, 0).0[3], 0);
+        assert_eq!(
+            logo_rgba
+                .get_pixel(logo_rgba.width() / 2, logo_rgba.height() / 2)
+                .0[3],
+            255
+        );
+
         assert!(Path::new("assets/icon.ico").is_file());
         assert!(Path::new("assets/icon.icns").is_file());
+
+        let ico_bytes = fs::read("assets/icon.ico").expect("read assets/icon.ico");
+        let ico_dec = IcoDecoder::new(Cursor::new(&ico_bytes)).expect("decode assets/icon.ico");
+        let (iw, ih) = ico_dec.dimensions();
+        let mut ico_buf = vec![0u8; ico_dec.total_bytes() as usize];
+        let color_type = ico_dec.color_type();
+        ico_dec.read_image(&mut ico_buf).expect("read ICO pixels");
+        assert_eq!(color_type, image::ColorType::Rgba8);
+        assert_eq!(ico_buf[3], 0, "ICO top-left corner must be transparent");
+        let ico_center = (((ih / 2) * iw + (iw / 2)) * 4) as usize;
+        assert_eq!(ico_buf[ico_center + 3], 255);
+    }
+
+    #[test]
+    #[ignore]
+    fn regenerate_rounded_icons_and_assets() {
+        let raw = fs::read("assets/logo.png").expect("read assets/logo.png");
+        let orig = image::load_from_memory(&raw).expect("decode assets/logo.png").to_rgba8();
+
+        // Crop existing transparent outer padding idempotently so re-running never shrinks further
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (orig.width(), orig.height(), 0u32, 0u32);
+        for (x, y, p) in orig.enumerate_pixels() {
+            if p.0[3] > 8 {
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+        let crop_w = (max_x - min_x + 1).max(1);
+        let crop_h = (max_y - min_y + 1).max(1);
+        let cropped = image::imageops::crop_imm(&orig, min_x, min_y, crop_w, crop_h).to_image();
+
+        let canvas_size: u32 = 1024;
+        let pad: u32 = 82; // ~8% transparent outer padding for macOS Dock & Windows 11 proportions
+        let inner_size = canvas_size - pad * 2; // 860x860 rounded square
+        let radius = inner_size as f32 * 0.22;
+
+        let inner_rgba = DynamicImage::ImageRgba8(cropped)
+            .resize_exact(inner_size, inner_size, FilterType::Lanczos3)
+            .to_rgba8();
+
+        let mut canvas = RgbaImage::from_pixel(canvas_size, canvas_size, Rgba([0, 0, 0, 0]));
+        for y in 0..inner_size {
+            for x in 0..inner_size {
+                let cov = rounded_rect_coverage(x, y, inner_size, radius);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let src = inner_rgba.get_pixel(x, y).0;
+                let alpha = ((src[3] as f32) * cov).round().clamp(0.0, 255.0) as u8;
+                if alpha > 0 {
+                    canvas.put_pixel(pad + x, pad + y, Rgba([src[0], src[1], src[2], alpha]));
+                }
+            }
+        }
+
+        write_rgba8_png(Path::new("assets/logo.png"), &canvas);
+
+        // Regenerate multi-resolution 32-bit RGBA assets/icon.ico via image's IcoEncoder
+        let rounded_dyn = DynamicImage::ImageRgba8(canvas);
+        let ico_sizes: &[u32] = &[16, 24, 32, 48, 64, 128, 256];
+        let mut frames: Vec<IcoFrame<'static>> = Vec::with_capacity(ico_sizes.len());
+        for &size in ico_sizes {
+            let resized = rounded_dyn
+                .resize_exact(size, size, FilterType::Lanczos3)
+                .to_rgba8();
+            let frame = IcoFrame::as_png(resized.as_raw(), size, size, ExtendedColorType::Rgba8)
+                .expect("encode RGBA ICO frame");
+            frames.push(frame);
+        }
+        let mut ico_bytes = Vec::new();
+        IcoEncoder::new(&mut ico_bytes)
+            .encode_images(&frames)
+            .expect("encode multi-size ICO");
+        fs::write("assets/icon.ico", &ico_bytes).expect("write assets/icon.ico");
+
+        // Regenerate Apple assets/icon.icns with full 32-bit RGBA PNG chunks
+        let icns_specs: &[(&[u8; 4], u32)] = &[
+            (b"icp4", 16),
+            (b"icp5", 32),
+            (b"icp6", 64),
+            (b"ic07", 128),
+            (b"ic08", 256),
+            (b"ic09", 512),
+            (b"ic10", 1024),
+        ];
+        let mut chunks: Vec<(&[u8; 4], Vec<u8>)> = Vec::with_capacity(icns_specs.len());
+        let mut total_len: u32 = 8;
+        for &(tag, size) in icns_specs {
+            let resized = rounded_dyn
+                .resize_exact(size, size, FilterType::Lanczos3)
+                .to_rgba8();
+            let mut png_buf = Vec::new();
+            PngEncoder::new(&mut png_buf)
+                .write_image(resized.as_raw(), size, size, ExtendedColorType::Rgba8)
+                .expect("encode RGBA ICNS chunk");
+            total_len += 8 + png_buf.len() as u32;
+            chunks.push((tag, png_buf));
+        }
+        let mut icns = Vec::with_capacity(total_len as usize);
+        icns.extend_from_slice(b"icns");
+        icns.extend_from_slice(&total_len.to_be_bytes());
+        for (tag, png_buf) in chunks {
+            icns.extend_from_slice(tag);
+            icns.extend_from_slice(&((8 + png_buf.len()) as u32).to_be_bytes());
+            icns.extend_from_slice(&png_buf);
+        }
+        fs::write("assets/icon.icns", &icns).expect("write assets/icon.icns");
+    }
+
+    #[test]
+    #[ignore]
+    fn generate_macos_iconset_files() {
+        let img = image::load_from_memory(LOGO_PNG_BYTES).expect("decode embedded logo.png");
+        let iconset_dir = Path::new("AppIcon.iconset");
+        let _ = fs::remove_dir_all(iconset_dir);
+        fs::create_dir_all(iconset_dir).expect("create AppIcon.iconset");
+
+        let specs: &[(&str, u32)] = &[
+            ("icon_16x16.png", 16),
+            ("icon_16x16@2x.png", 32),
+            ("icon_32x32.png", 32),
+            ("icon_32x32@2x.png", 64),
+            ("icon_128x128.png", 128),
+            ("icon_128x128@2x.png", 256),
+            ("icon_256x256.png", 256),
+            ("icon_256x256@2x.png", 512),
+            ("icon_512x512.png", 512),
+            ("icon_512x512@2x.png", 1024),
+        ];
+
+        for &(filename, size) in specs {
+            let resized = img.resize_exact(size, size, FilterType::Lanczos3).to_rgba8();
+            write_rgba8_png(&iconset_dir.join(filename), &resized);
+        }
     }
 }

@@ -417,6 +417,7 @@ struct SharedMixerState {
     measured_mic_in_fps: AtomicU32,
     measured_vmic_out_fps: AtomicU32,
     is_playing: AtomicBool,
+    scrub_paused: AtomicBool,
     progress_bits: AtomicU32,
     active_frame_count: AtomicUsize,
     playback_pos_frames_bits: AtomicU64,
@@ -455,6 +456,7 @@ impl SharedMixerState {
             measured_mic_in_fps: AtomicU32::new(0),
             measured_vmic_out_fps: AtomicU32::new(0),
             is_playing: AtomicBool::new(false),
+            scrub_paused: AtomicBool::new(false),
             progress_bits: AtomicU32::new(0.0f32.to_bits()),
             active_frame_count: AtomicUsize::new(0),
             playback_pos_frames_bits: AtomicU64::new(0.0f64.to_bits()),
@@ -583,12 +585,14 @@ impl AudioBackend for SoftwareMixerBackend {
         self.shared
             .progress_bits
             .store(0.0f32.to_bits(), Ordering::Release);
+        self.shared.scrub_paused.store(false, Ordering::Release);
         self.shared.is_playing.store(true, Ordering::Release);
         self.shared.play_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     fn stop(&self) {
         self.shared.is_playing.store(false, Ordering::Release);
+        self.shared.scrub_paused.store(false, Ordering::Release);
         self.shared.active_frame_count.store(0, Ordering::Release);
         if let Ok(mut guard) = self.shared.active_sound.lock() {
             *guard = None;
@@ -652,6 +656,10 @@ impl AudioBackend for SoftwareMixerBackend {
             .progress_bits
             .store(clamped_progress.to_bits(), Ordering::Release);
         self.shared.seek_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn set_scrub_paused(&self, paused: bool) {
+        self.shared.scrub_paused.store(paused, Ordering::Release);
     }
 
     fn set_speed(&self, speed: f32) {
@@ -851,6 +859,7 @@ fn audio_manager_loop(
 
         if shared.leader_stream.load(Ordering::Acquire) == LEADER_FALLBACK
             && shared.is_playing.load(Ordering::Acquire)
+            && !shared.scrub_paused.load(Ordering::Acquire)
         {
             advance_fallback_clock(&shared, dt);
         }
@@ -1253,7 +1262,8 @@ where
                     local_seek_epoch = se;
                 }
 
-                let playing_flag = shared.is_playing.load(Ordering::Acquire);
+                let playing_flag = shared.is_playing.load(Ordering::Acquire)
+                    && !shared.scrub_paused.load(Ordering::Acquire);
                 let speed = shared.speed().clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED) as f64;
                 let frame_step = speed * base_rate_step;
                 let is_leader = shared.leader_stream.load(Ordering::Acquire) == role_leader_id;
@@ -1442,6 +1452,15 @@ mod tests {
 
         backend.seek_relative_secs(-10.0);
         assert!(backend.playback_progress() <= 0.02);
+
+        // Scrub pause keeps playback armed while holding position until seek commit + unpause
+        backend.set_scrub_paused(true);
+        assert!(backend.is_playing());
+        assert!(backend.shared_state().scrub_paused.load(Ordering::Acquire));
+        backend.seek_to_progress(0.4);
+        assert!((backend.playback_progress() - 0.4).abs() < 0.02);
+        backend.set_scrub_paused(false);
+        assert!(!backend.shared_state().scrub_paused.load(Ordering::Acquire));
 
         backend.set_speed(3.0);
         assert_eq!(backend.speed(), MAX_PLAYBACK_SPEED);

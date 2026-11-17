@@ -1329,15 +1329,17 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
     pitchReadout.textContent = clamped.toFixed(2) + 'x';
   }
 
+  let lastDur = 0;
   function updateSeekVisual(tick) {
     const dur = Number(tick.duration_secs || 0);
+    lastDur = dur;
     const prog = tick.is_playing ? Math.min(1, Math.max(0, Number(tick.progress || 0))) : 0;
     if (!isSeeking) {
       seekSlider.value = String(Math.round(prog * 1000));
       const pct = (prog * 100).toFixed(2) + '%';
       seekSlider.style.background = `linear-gradient(to right, var(--accent) 0%, var(--accent) ${pct}, var(--gauge-track) ${pct}, var(--gauge-track) 100%)`;
+      timeLabel.textContent = fmtTime(dur * prog) + ' / ' + fmtTime(dur);
     }
-    timeLabel.textContent = fmtTime(dur * prog) + ' / ' + fmtTime(dur);
   }
 
   function waveSvg() {
@@ -1485,7 +1487,7 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
     const p = Number(seekSlider.value) / 1000;
     const pct = (p * 100).toFixed(2) + '%';
     seekSlider.style.background = `linear-gradient(to right, var(--accent) 0%, var(--accent) ${pct}, var(--gauge-track) ${pct}, var(--gauge-track) 100%)`;
-    sendCmd({ cmd: 'Seek', progress: p });
+    timeLabel.textContent = fmtTime(lastDur * p) + ' / ' + fmtTime(lastDur);
   });
   seekSlider.addEventListener('change', () => {
     isSeeking = false;

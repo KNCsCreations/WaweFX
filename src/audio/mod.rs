@@ -62,6 +62,7 @@ pub trait AudioBackend: Send + Sync {
     fn stop(&self);
     fn seek_relative_secs(&self, delta_secs: f32);
     fn seek_to_progress(&self, progress: f32);
+    fn set_scrub_paused(&self, paused: bool);
     fn set_speed(&self, speed: f32);
     fn speed(&self) -> f32;
     fn set_mic_volume(&self, volume: f32);
@@ -166,6 +167,11 @@ impl AudioEngine {
     /// Seeks directly to a normalized playback position in `0.0..=1.0`.
     pub fn seek_to_progress(&self, progress: f32) {
         self.backend.seek_to_progress(progress);
+    }
+
+    /// Mutes/pauses sound playback temporarily during timeline scrubbing without clearing the active sound.
+    pub fn set_scrub_paused(&self, paused: bool) {
+        self.backend.set_scrub_paused(paused);
     }
 
     pub fn apply_routing_config(&self, config: &AudioRoutingConfig) {

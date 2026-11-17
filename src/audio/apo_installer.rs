@@ -112,6 +112,8 @@ mod windows_apo {
 
         fn seek_to_progress(&self, _progress: f32) {}
 
+        fn set_scrub_paused(&self, _paused: bool) {}
+
         fn set_speed(&self, speed: f32) {
             let clamped = speed.clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED);
             self.speed_bits.store(clamped.to_bits(), Ordering::Relaxed);
