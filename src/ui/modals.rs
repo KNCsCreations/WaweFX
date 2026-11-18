@@ -7,6 +7,7 @@ use qrcode::{Color as QrColor, QrCode};
 use crate::audio::{AudioDeviceList, AudioEngine, AudioEngineStatus, apo_installer};
 use crate::config::{AppConfig, SoundItem, ThemeConfig, ThemePreset, rgb_to_color32};
 use crate::hotkeys::{self, HotkeyStatus, ShortcutCapture};
+use crate::updater::{self, CURRENT_VERSION, GITHUB_REPO_SLUG, UpdateCheckState};
 
 fn is_light_rgb(rgb: [u8; 3]) -> bool {
     let luma = 0.299 * rgb[0] as f32 + 0.587 * rgb[1] as f32 + 0.114 * rgb[2] as f32;
@@ -304,6 +305,7 @@ pub fn render_modals(
     status: &AudioEngineStatus,
     hotkey_status: &HotkeyStatus,
     driver_setup: &DriverSetupState,
+    update_state: &UpdateCheckState,
     local_ip: &str,
     connected_clients: usize,
 ) -> ModalOutcome {
@@ -314,7 +316,14 @@ pub fn render_modals(
             render_sound_editor_modal(ctx, draft, config, &mut outcome);
         }
         ActiveModal::Settings => {
-            render_settings_modal(ctx, config, devices, driver_setup, &mut outcome);
+            render_settings_modal(
+                ctx,
+                config,
+                devices,
+                driver_setup,
+                update_state,
+                &mut outcome,
+            );
         }
         ActiveModal::Alerts => {
             render_alerts_modal(
@@ -607,6 +616,7 @@ fn render_settings_modal(
     config: &mut AppConfig,
     devices: &AudioDeviceList,
     driver_setup: &DriverSetupState,
+    update_state: &UpdateCheckState,
     outcome: &mut ModalOutcome,
 ) {
     let mut open = true;
@@ -910,7 +920,48 @@ fn render_settings_modal(
                     outcome.config_dirty = true;
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // --- Section 4: Version & Updates ---
+                ui.heading("About & Updates");
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("WaweFX v{CURRENT_VERSION}"))
+                            .strong(),
+                    );
+                    ui.small(format!("({GITHUB_REPO_SLUG})"));
+                    ui.label("•");
+                    match update_state {
+                        UpdateCheckState::Checking => {
+                            ui.small("Checking GitHub Releases...");
+                        }
+                        UpdateCheckState::UpToDate => {
+                            ui.colored_label(Color32::from_rgb(46, 160, 67), "Up to date");
+                        }
+                        UpdateCheckState::UpdateAvailable(info) => {
+                            let accent = rgb_to_color32(config.theme.accent_color);
+                            ui.colored_label(
+                                accent,
+                                egui::RichText::new(format!("New version available: v{}", info.version))
+                                    .strong(),
+                            );
+                            if ui
+                                .add(primary_accent_button("Open Release Page", &config.theme))
+                                .clicked()
+                            {
+                                updater::open_release_url(&info.url);
+                            }
+                        }
+                        UpdateCheckState::OfflineOrUnavailable => {
+                            ui.small("Offline / GitHub check skipped");
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui.button("Reset to Warm Beige").clicked() {
                         config.theme.apply_preset(ThemePreset::WarmBeige);

@@ -23,6 +23,7 @@ use crate::config::{AppConfig, SoundItem, rgb_to_color32};
 use crate::hotkeys::{HotkeyAction, HotkeyService};
 use crate::sync::{DesktopSyncNotice, SyncServerHandle};
 use crate::ui::modals::{ActiveModal, DriverSetupState, SoundModalDraft};
+use crate::updater::UpdateChecker;
 
 struct DecodeRequest {
     sound_id: String,
@@ -177,6 +178,7 @@ pub struct WaweFxApp {
     pub cached_devices: AudioDeviceList,
     pub driver_setup: DriverSetupState,
     pub hotkeys: HotkeyService,
+    pub updater: UpdateChecker,
     pub local_ip: String,
     pub last_error: Option<String>,
     last_playback_state: (bool, Option<String>),
@@ -194,6 +196,7 @@ impl WaweFxApp {
         let last_playback_state = (audio.is_playing(), audio.active_sound_id());
         let mut hotkeys = HotkeyService::new(ctx);
         hotkeys.sync_bindings(&config);
+        let updater = UpdateChecker::spawn(ctx.clone());
 
         Self {
             config,
@@ -204,6 +207,7 @@ impl WaweFxApp {
             cached_devices,
             driver_setup: DriverSetupState::default(),
             hotkeys,
+            updater,
             local_ip,
             last_error: None,
             last_playback_state,
@@ -401,12 +405,19 @@ impl eframe::App for WaweFxApp {
         let bg_main = rgb_to_color32(self.config.theme.bg_main);
 
         // Top Pixel-Accurate Toolbar
+        let available_update = self.updater.available_update();
         let tb_action = egui::TopBottomPanel::top("wawefx_toolbar")
             .exact_height(toolbar::TOOLBAR_HEIGHT)
             .show_separator_line(false)
             .frame(egui::Frame::NONE.fill(bg_toolbar))
             .show(ctx, |ui| {
-                toolbar::render_toolbar(ui, &mut self.config, &self.audio, show_alert_badge)
+                toolbar::render_toolbar(
+                    ui,
+                    &mut self.config,
+                    &self.audio,
+                    show_alert_badge,
+                    available_update.as_ref(),
+                )
             })
             .inner;
 
@@ -610,6 +621,7 @@ impl eframe::App for WaweFxApp {
             let mut modal_cfg = self.config.clone();
             modal_cfg.audio.sync_port = bound_port;
 
+            let update_state = self.updater.check_state();
             let outcome = modals::render_modals(
                 ctx,
                 &mut modal,
@@ -618,6 +630,7 @@ impl eframe::App for WaweFxApp {
                 &status,
                 self.hotkeys.status(),
                 &self.driver_setup,
+                &update_state,
                 &self.local_ip,
                 connected_clients,
             );

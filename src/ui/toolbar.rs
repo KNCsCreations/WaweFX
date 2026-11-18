@@ -1,12 +1,13 @@
 use std::f32::consts::{FRAC_PI_2, PI};
 
-use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::audio::AudioEngine;
 use crate::config::{
     AppConfig, MAX_PLAYBACK_SPEED, MAX_STREAM_VOLUME, MIN_PLAYBACK_SPEED, MIN_STREAM_VOLUME,
     rgb_to_color32,
 };
+use crate::updater::{self, UpdateInfo};
 
 /// Height of the top toolbar strip above the 1px divider line.
 pub const TOOLBAR_HEIGHT: f32 = 46.0;
@@ -34,6 +35,7 @@ pub fn render_toolbar(
     config: &mut AppConfig,
     audio: &AudioEngine,
     has_audio_warning: bool,
+    update_info: Option<&UpdateInfo>,
 ) -> ToolbarAction {
     let mut action = ToolbarAction::default();
     let theme = &config.theme;
@@ -142,9 +144,82 @@ pub fn render_toolbar(
     // --- Right Cluster Anchor ---
     let right_base = (bar_rect.max.x - 240.0).max(x0 + 280.0);
 
-    // --- Center Horizontal Timeline / Seek Bar ---
-    let slider_left = (x0 + 275.0).min(right_base - 95.0);
-    let slider_right = (right_base - 35.0).max(slider_left + 60.0);
+    // --- Center Horizontal Timeline / Seek Bar (+ optional Update Pill Badge) ---
+    let slider_left = (x0 + 260.0).min(right_base - 95.0);
+    let badge_right_limit = right_base - 14.0;
+    let mut slider_right = (right_base - 30.0).max(slider_left + 60.0);
+
+    if let Some(info) = update_info {
+        let label = format!("New version available (v{})", info.version);
+        let font = egui::FontId::proportional(10.5);
+        let luma = 0.299 * accent.r() as f32 + 0.587 * accent.g() as f32 + 0.114 * accent.b() as f32;
+        let badge_fg = if luma > 175.0 {
+            Color32::from_rgb(0x2B, 0x25, 0x20)
+        } else {
+            Color32::WHITE
+        };
+        let galley = ui.painter().layout_no_wrap(label, font.clone(), badge_fg);
+        let max_badge_w = (badge_right_limit - (slider_left + 64.0)).max(0.0);
+        let desired_w = galley.size().x + 16.0;
+        let badge_w = if desired_w <= max_badge_w {
+            desired_w
+        } else {
+            max_badge_w.min(desired_w)
+        };
+
+        if badge_w >= 84.0 {
+            let badge_rect = Rect::from_min_size(
+                Pos2::new(badge_right_limit - badge_w, y0 + 11.5),
+                Vec2::new(badge_w, 22.0),
+            );
+            slider_right = (badge_rect.min.x - 14.0).max(slider_left + 50.0);
+
+            let badge_resp = ui
+                .interact(badge_rect, ui.id().with("tb_update_badge"), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!(
+                    "Open GitHub Release v{} in browser\n{}",
+                    info.version, info.url
+                ));
+
+            let bg_fill = if badge_resp.hovered() {
+                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 230)
+            } else {
+                accent
+            };
+            let p = ui.painter();
+            p.rect_filled(badge_rect, CornerRadius::same(11), bg_fill);
+            if badge_resp.hovered() {
+                p.rect_stroke(
+                    badge_rect,
+                    CornerRadius::same(11),
+                    Stroke::new(1.2_f32, badge_fg),
+                    StrokeKind::Inside,
+                );
+            }
+
+            if desired_w <= badge_w {
+                let text_pos = Pos2::new(
+                    badge_rect.center().x - galley.size().x * 0.5,
+                    badge_rect.center().y - galley.size().y * 0.5,
+                );
+                p.galley(text_pos, galley, badge_fg);
+            } else {
+                p.text(
+                    badge_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    format!("Update v{}", info.version),
+                    font,
+                    badge_fg,
+                );
+            }
+
+            if badge_resp.clicked() {
+                updater::open_release_url(&info.url);
+            }
+        }
+    }
+
     let slider_rect = Rect::from_min_max(
         Pos2::new(slider_left, y0 + 15.0),
         Pos2::new(slider_right, y0 + 31.0),

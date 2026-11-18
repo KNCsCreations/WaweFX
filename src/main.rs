@@ -5,6 +5,7 @@ pub mod config;
 pub mod hotkeys;
 pub mod sync;
 pub mod ui;
+pub mod updater;
 
 use std::sync::Arc;
 
