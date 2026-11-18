@@ -365,7 +365,7 @@ fn build_state_payload(
     let dtos = sounds
         .iter()
         .map(|s| {
-            let has_thumb = s.image_path.as_ref().is_some_and(|p| p.exists());
+            let has_thumb = s.resolved_image_path().is_some_and(|p| p.exists());
             SyncSoundDto {
                 id: s.id.clone(),
                 title: s.title.clone(),
@@ -622,7 +622,7 @@ async fn serve_thumbnail(
         sounds
             .iter()
             .find(|s| s.id == id)
-            .and_then(|s| s.image_path.clone())
+            .and_then(|s| s.resolved_image_path())
     };
 
     let Some(path) = image_path else {

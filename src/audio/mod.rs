@@ -112,7 +112,8 @@ impl AudioEngine {
 
     /// Decodes a [`SoundItem`] offline into a 48 kHz stereo buffer and stores it in the cache.
     pub fn decode_and_cache(&self, sound: &SoundItem) -> Result<DecodedSoundBuffer> {
-        let decoded = mixer::decode_audio_file(&sound.audio_path)?;
+        let resolved_path = sound.resolved_audio_path();
+        let decoded = mixer::decode_audio_file(&resolved_path)?;
         if let Ok(mut guard) = self.decoded_cache.write() {
             guard.insert(sound.id.clone(), decoded.clone());
         }

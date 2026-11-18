@@ -12,6 +12,12 @@ pub const CONFIG_FILE_NAME: &str = "wawefx_config.json";
 /// Subdirectory inside the OS configuration directory used by WaweFX.
 pub const CONFIG_APP_DIR_NAME: &str = "WaweFX";
 
+/// Managed subdirectory inside the WaweFX AppData root holding copied sound files.
+pub const SOUNDS_SUBDIR: &str = "sounds";
+
+/// Managed subdirectory inside the WaweFX AppData root holding copied pad cover images.
+pub const COVERS_SUBDIR: &str = "covers";
+
 /// Uniform internal audio mixer sample rate (Hz) used across normalized sound buffers.
 pub const TARGET_SAMPLE_RATE: u32 = 48_000;
 
@@ -78,6 +84,18 @@ impl SoundItem {
         let minutes = total_secs / 60;
         let seconds = total_secs % 60;
         format!("{minutes:02}:{seconds:02}")
+    }
+
+    /// Resolves `audio_path` against the managed WaweFX AppData directory when stored relatively.
+    pub fn resolved_audio_path(&self) -> PathBuf {
+        AppConfig::resolve_asset_path(&self.audio_path)
+    }
+
+    /// Resolves `image_path` against the managed WaweFX AppData directory when stored relatively.
+    pub fn resolved_image_path(&self) -> Option<PathBuf> {
+        self.image_path
+            .as_deref()
+            .map(AppConfig::resolve_asset_path)
     }
 }
 
@@ -293,6 +311,229 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// Returns the managed WaweFX user data directory (`%APPDATA%\WaweFX` on Windows,
+    /// `~/Library/Application Support/WaweFX` on macOS), falling back to `<temp>/WaweFX`.
+    pub fn data_dir() -> PathBuf {
+        Self::resolve_data_dir(dirs::config_dir())
+    }
+
+    fn resolve_data_dir(config_dir: Option<PathBuf>) -> PathBuf {
+        match config_dir {
+            Some(dir) => dir.join(CONFIG_APP_DIR_NAME),
+            None => std::env::temp_dir().join(CONFIG_APP_DIR_NAME),
+        }
+    }
+
+    /// Ensures `<data_dir>`, `<data_dir>/sounds`, and `<data_dir>/covers` exist on disk.
+    pub fn ensure_data_dirs() -> anyhow::Result<PathBuf> {
+        let base = Self::data_dir();
+        Self::ensure_data_dirs_in(&base)?;
+        Ok(base)
+    }
+
+    fn ensure_data_dirs_in(base_dir: &Path) -> anyhow::Result<()> {
+        for sub in [SOUNDS_SUBDIR, COVERS_SUBDIR] {
+            let dir = base_dir.join(sub);
+            fs::create_dir_all(&dir).with_context(|| {
+                format!("failed to create managed storage directory {}", dir.display())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Resolves a stored relative asset path against [`AppConfig::data_dir`], or returns
+    /// an already-absolute path unchanged.
+    pub fn resolve_asset_path(stored_path: &Path) -> PathBuf {
+        Self::resolve_asset_path_in(&Self::data_dir(), stored_path)
+    }
+
+    fn resolve_asset_path_in(base_dir: &Path, stored_path: &Path) -> PathBuf {
+        if stored_path.as_os_str().is_empty() || stored_path.is_absolute() {
+            stored_path.to_path_buf()
+        } else {
+            base_dir.join(stored_path)
+        }
+    }
+
+    /// Copies an external audio file into `<data_dir>/sounds` and returns its relative path (`sounds/<file>`).
+    pub fn import_sound_file(source: &Path) -> anyhow::Result<PathBuf> {
+        Self::import_asset_into_dir(&Self::data_dir(), SOUNDS_SUBDIR, source)
+    }
+
+    /// Copies an external cover image into `<data_dir>/covers` and returns its relative path (`covers/<file>`).
+    pub fn import_cover_file(source: &Path) -> anyhow::Result<PathBuf> {
+        Self::import_asset_into_dir(&Self::data_dir(), COVERS_SUBDIR, source)
+    }
+
+    fn import_asset_into_dir(base_dir: &Path, subdir: &str, source: &Path) -> anyhow::Result<PathBuf> {
+        Self::ensure_data_dirs_in(base_dir)?;
+
+        // Already a stored relative managed path under `<base_dir>/<subdir>`
+        if source.is_relative()
+            && source.starts_with(subdir)
+            && let Some(file_name) = source.file_name()
+        {
+            let rel = PathBuf::from(subdir).join(file_name);
+            if base_dir.join(&rel).is_file() {
+                return Ok(rel);
+            }
+        }
+
+        let target_dir = base_dir.join(subdir);
+        if let Ok(rel_to_sub) = source.strip_prefix(&target_dir)
+            && rel_to_sub.components().count() == 1
+            && source.is_file()
+        {
+            return Ok(PathBuf::from(subdir).join(rel_to_sub));
+        }
+
+        if !source.is_file() {
+            anyhow::bail!("source file '{}' does not exist", source.display());
+        }
+
+        let stem = source
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(sanitize_filename_stem)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "asset".to_string());
+        let short_id = &Uuid::new_v4().simple().to_string()[..8];
+        let ext = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| !e.trim().is_empty())
+            .map(|e| e.to_ascii_lowercase());
+
+        let file_name = match ext {
+            Some(ext) => format!("{stem}_{short_id}.{ext}"),
+            None => format!("{stem}_{short_id}"),
+        };
+        let rel_path = PathBuf::from(subdir).join(&file_name);
+        let dest_path = base_dir.join(&rel_path);
+
+        fs::copy(source, &dest_path).with_context(|| {
+            format!(
+                "failed to copy asset '{}' into '{}'",
+                source.display(),
+                dest_path.display()
+            )
+        })?;
+
+        Ok(rel_path)
+    }
+
+    /// Migrates any valid external audio/cover files referenced in `sounds` into `sounds/` and `covers/`.
+    pub fn migrate_external_assets_in(&mut self, base_dir: &Path) -> bool {
+        if let Err(err) = Self::ensure_data_dirs_in(base_dir) {
+            tracing::warn!("Failed to initialize managed storage directories: {err:#}");
+            return false;
+        }
+
+        let mut migrated = false;
+        for sound in &mut self.sounds {
+            if sound.audio_path.is_absolute() && sound.audio_path.is_file() {
+                match Self::import_asset_into_dir(base_dir, SOUNDS_SUBDIR, &sound.audio_path) {
+                    Ok(rel) => {
+                        if sound.audio_path != rel {
+                            sound.audio_path = rel;
+                            migrated = true;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Could not migrate audio '{}' for '{}': {err:#}",
+                            sound.audio_path.display(),
+                            sound.title
+                        );
+                    }
+                }
+            }
+
+            if let Some(ref img_path) = sound.image_path.clone()
+                && img_path.is_absolute()
+                && img_path.is_file()
+            {
+                match Self::import_asset_into_dir(base_dir, COVERS_SUBDIR, img_path) {
+                    Ok(rel) => {
+                        if sound.image_path.as_ref() != Some(&rel) {
+                            sound.image_path = Some(rel);
+                            migrated = true;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Could not migrate cover '{}' for '{}': {err:#}",
+                            img_path.display(),
+                            sound.title
+                        );
+                    }
+                }
+            }
+        }
+        migrated
+    }
+
+    /// Deletes a managed file from `sounds/` or `covers/` if no remaining [`SoundItem`] references it.
+    pub fn cleanup_managed_path(&self, candidate: &Path) {
+        self.cleanup_managed_path_in(&Self::data_dir(), candidate);
+    }
+
+    fn cleanup_managed_path_in(&self, base_dir: &Path, candidate: &Path) {
+        if candidate.as_os_str().is_empty() {
+            return;
+        }
+        let resolved_candidate = Self::resolve_asset_path_in(base_dir, candidate);
+        let in_sounds = resolved_candidate.starts_with(base_dir.join(SOUNDS_SUBDIR));
+        let in_covers = resolved_candidate.starts_with(base_dir.join(COVERS_SUBDIR));
+        if (!in_sounds && !in_covers) || !resolved_candidate.is_file() {
+            return;
+        }
+
+        let still_referenced = self.sounds.iter().any(|s| {
+            Self::resolve_asset_path_in(base_dir, &s.audio_path) == resolved_candidate
+                || s.image_path
+                    .as_deref()
+                    .is_some_and(|p| Self::resolve_asset_path_in(base_dir, p) == resolved_candidate)
+        });
+        if still_referenced {
+            return;
+        }
+
+        if let Err(err) = fs::remove_file(&resolved_candidate) {
+            tracing::warn!(
+                "Failed to remove orphaned asset {}: {err}",
+                resolved_candidate.display()
+            );
+        }
+    }
+
+    /// Opens the managed WaweFX AppData folder in the OS file browser.
+    pub fn open_data_folder() -> anyhow::Result<()> {
+        let dir = Self::ensure_data_dirs()?;
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("explorer")
+                .arg(&dir)
+                .spawn()
+                .with_context(|| format!("failed to open Explorer at {}", dir.display()))?;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("open")
+                .arg(&dir)
+                .spawn()
+                .with_context(|| format!("failed to open Finder at {}", dir.display()))?;
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            std::process::Command::new("xdg-open")
+                .arg(&dir)
+                .spawn()
+                .with_context(|| format!("failed to open file manager at {}", dir.display()))?;
+        }
+        Ok(())
+    }
+
     /// Returns the platform-appropriate configuration file path:
     /// `<config_dir>/WaweFX/wawefx_config.json` (e.g. `~/Library/Application Support/WaweFX/wawefx_config.json`
     /// on macOS or `%APPDATA%\WaweFX\wawefx_config.json` on Windows), falling back to
@@ -308,16 +549,29 @@ impl AppConfig {
         }
     }
 
-    /// Loads configuration from `wawefx_config.json`, falling back to defaults when missing or unreadable.
+    /// Ensures managed directories exist and loads configuration from `wawefx_config.json`,
+    /// migrating any valid external asset paths into managed `sounds/` and `covers/` folders.
     pub fn load_or_default() -> Self {
+        let data_dir = Self::data_dir();
+        if let Err(err) = Self::ensure_data_dirs_in(&data_dir) {
+            tracing::warn!("Failed to ensure WaweFX data folders: {err:#}");
+        }
+
         let path = Self::config_path();
         if !path.exists() {
             return Self::default();
         }
-        Self::load_from_path(&path).unwrap_or_else(|err| {
+        let mut cfg = Self::load_from_path(&path).unwrap_or_else(|err| {
             tracing::warn!("Failed to load config from {}: {err:#}. Using defaults.", path.display());
             Self::default()
-        })
+        });
+
+        if cfg.migrate_external_assets_in(&data_dir)
+            && let Err(err) = cfg.save_to_path(&path)
+        {
+            tracing::warn!("Failed to save migrated config to {}: {err:#}", path.display());
+        }
+        cfg
     }
 
     /// Loads and validates configuration from an explicit file path.
@@ -583,4 +837,79 @@ mod tests {
         assert_eq!(unbound_stop, vec!["Global Stop All Sounds".to_string()]);
         assert_eq!(cfg.stop_shortcut, None);
     }
+
+    #[test]
+    fn manages_self_contained_asset_copy_resolve_and_cleanup() {
+        let root = std::env::temp_dir().join(format!("wawefx_managed_{}", Uuid::new_v4()));
+        let ext_dir = root.join("Downloads");
+        let app_dir = root.join("AppData").join("WaweFX");
+        fs::create_dir_all(&ext_dir).unwrap();
+
+        let src_audio = ext_dir.join("air horn!.wav");
+        let src_cover = ext_dir.join("cover.png");
+        fs::write(&src_audio, b"RIFFdemo").unwrap();
+        fs::write(&src_cover, b"\x89PNGdemo").unwrap();
+
+        let mut cfg = AppConfig::default();
+        let mut s1 = SoundItem::new("Airhorn", src_audio.clone(), Some(src_cover.clone()), 1.0);
+        cfg.sounds.push(s1.clone());
+
+        assert!(cfg.migrate_external_assets_in(&app_dir));
+        assert!(cfg.sounds[0].audio_path.starts_with(SOUNDS_SUBDIR));
+        assert!(
+            cfg.sounds[0]
+                .image_path
+                .as_ref()
+                .is_some_and(|p| p.starts_with(COVERS_SUBDIR))
+        );
+
+        let managed_audio = AppConfig::resolve_asset_path_in(&app_dir, &cfg.sounds[0].audio_path);
+        let managed_cover = AppConfig::resolve_asset_path_in(
+            &app_dir,
+            cfg.sounds[0].image_path.as_deref().unwrap(),
+        );
+        assert!(managed_audio.is_file());
+        assert!(managed_cover.is_file());
+
+        // Deleting originals in Downloads leaves managed copies intact
+        fs::remove_file(&src_audio).unwrap();
+        fs::remove_file(&src_cover).unwrap();
+        assert!(managed_audio.is_file());
+        assert!(managed_cover.is_file());
+
+        // Add a second pad sharing the same managed audio to test reference-safe cleanup
+        s1 = cfg.sounds[0].clone();
+        let mut s2 = SoundItem::new("Clone", s1.audio_path.clone(), None, 1.0);
+        s2.audio_path = s1.audio_path.clone();
+        cfg.sounds.push(s2);
+
+        let removed = cfg.sounds.remove(0);
+        cfg.cleanup_managed_path_in(&app_dir, &removed.audio_path);
+        if let Some(ref img) = removed.image_path {
+            cfg.cleanup_managed_path_in(&app_dir, img);
+        }
+        assert!(managed_audio.is_file(), "shared audio must remain");
+        assert!(!managed_cover.exists(), "unreferenced cover must be deleted");
+
+        let removed2 = cfg.sounds.remove(0);
+        cfg.cleanup_managed_path_in(&app_dir, &removed2.audio_path);
+        assert!(!managed_audio.exists(), "unreferenced audio must be deleted");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+fn sanitize_filename_stem(stem: &str) -> String {
+    let mut out = String::with_capacity(stem.len().min(32));
+    for ch in stem.chars() {
+        if out.len() >= 32 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if ch.is_ascii_whitespace() && !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
 }

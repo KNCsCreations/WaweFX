@@ -5,8 +5,105 @@ use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
 use qrcode::{Color as QrColor, QrCode};
 
 use crate::audio::{AudioDeviceList, AudioEngine, AudioEngineStatus, apo_installer};
-use crate::config::{AppConfig, SoundItem, ThemePreset};
+use crate::config::{AppConfig, SoundItem, ThemeConfig, ThemePreset, rgb_to_color32};
 use crate::hotkeys::{self, HotkeyStatus, ShortcutCapture};
+
+fn is_light_rgb(rgb: [u8; 3]) -> bool {
+    let luma = 0.299 * rgb[0] as f32 + 0.587 * rgb[1] as f32 + 0.114 * rgb[2] as f32;
+    luma > 128.0
+}
+
+fn contrast_on_accent(accent: Color32) -> Color32 {
+    let luma = 0.299 * accent.r() as f32 + 0.587 * accent.g() as f32 + 0.114 * accent.b() as f32;
+    if luma > 175.0 {
+        Color32::from_rgb(0x2B, 0x25, 0x20)
+    } else {
+        Color32::WHITE
+    }
+}
+
+/// Applies the active [`ThemeConfig`] palette across all `egui` windows, popups, dropdowns, and widgets.
+pub fn apply_theme_visuals(ctx: &egui::Context, theme: &ThemeConfig) {
+    let bg_color = rgb_to_color32(theme.bg_main);
+    let surface_color = rgb_to_color32(theme.bg_toolbar);
+    let card_color = rgb_to_color32(theme.pad_card_bg);
+    let hover_color = rgb_to_color32(theme.pad_card_hover);
+    let border_color = rgb_to_color32(theme.toolbar_divider);
+    let accent = rgb_to_color32(theme.accent_color);
+    let text_color = rgb_to_color32(theme.pad_text);
+    let muted_color = rgb_to_color32(theme.icon_secondary);
+    let light_mode = is_light_rgb(theme.bg_toolbar);
+
+    let mut visuals = if light_mode {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+
+    visuals.panel_fill = bg_color;
+    visuals.window_fill = surface_color;
+    visuals.window_stroke = Stroke::new(1.0_f32, border_color);
+    visuals.window_corner_radius = CornerRadius::same(12);
+    visuals.menu_corner_radius = CornerRadius::same(8);
+    visuals.faint_bg_color = card_color;
+    visuals.extreme_bg_color = bg_color;
+    visuals.code_bg_color = card_color;
+    visuals.override_text_color = Some(text_color);
+
+    let accent_fg = contrast_on_accent(accent);
+    visuals.selection.bg_fill = accent;
+    visuals.selection.stroke = Stroke::new(1.0_f32, accent_fg);
+
+    let r = CornerRadius::same(7);
+    visuals.widgets.noninteractive.bg_fill = surface_color;
+    visuals.widgets.noninteractive.weak_bg_fill = surface_color;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, border_color);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, muted_color);
+    visuals.widgets.noninteractive.corner_radius = r;
+
+    visuals.widgets.inactive.bg_fill = card_color;
+    visuals.widgets.inactive.weak_bg_fill = card_color;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, border_color);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, text_color);
+    visuals.widgets.inactive.corner_radius = r;
+
+    visuals.widgets.hovered.bg_fill = hover_color;
+    visuals.widgets.hovered.weak_bg_fill = hover_color;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.2_f32, accent);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, text_color);
+    visuals.widgets.hovered.corner_radius = r;
+
+    visuals.widgets.active.bg_fill = accent;
+    visuals.widgets.active.weak_bg_fill = accent;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.2_f32, accent);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, accent_fg);
+    visuals.widgets.active.corner_radius = r;
+
+    visuals.widgets.open.bg_fill = hover_color;
+    visuals.widgets.open.weak_bg_fill = hover_color;
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, accent);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, text_color);
+    visuals.widgets.open.corner_radius = r;
+
+    ctx.set_visuals(visuals);
+}
+
+fn themed_modal_frame(ctx: &egui::Context, theme: &ThemeConfig) -> egui::Frame {
+    egui::Frame::window(&ctx.style())
+        .fill(rgb_to_color32(theme.bg_toolbar))
+        .stroke(Stroke::new(1.0_f32, rgb_to_color32(theme.toolbar_divider)))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(16))
+}
+
+fn primary_accent_button<'a>(label: &'a str, theme: &ThemeConfig) -> egui::Button<'a> {
+    let accent = rgb_to_color32(theme.accent_color);
+    let fg = contrast_on_accent(accent);
+    egui::Button::new(egui::RichText::new(label).strong().color(fg))
+        .fill(accent)
+        .stroke(Stroke::new(1.0_f32, accent))
+        .corner_radius(CornerRadius::same(7))
+}
 
 #[cfg(target_os = "windows")]
 const VBCABLE_ZIP_URL: &str =
@@ -220,10 +317,25 @@ pub fn render_modals(
             render_settings_modal(ctx, config, devices, driver_setup, &mut outcome);
         }
         ActiveModal::Alerts => {
-            render_alerts_modal(ctx, status, hotkey_status, devices, driver_setup, &mut outcome);
+            render_alerts_modal(
+                ctx,
+                &config.theme,
+                status,
+                hotkey_status,
+                devices,
+                driver_setup,
+                &mut outcome,
+            );
         }
         ActiveModal::CompanionPairing => {
-            render_companion_modal(ctx, config.audio.sync_port, local_ip, connected_clients, &mut outcome);
+            render_companion_modal(
+                ctx,
+                &config.theme,
+                config.audio.sync_port,
+                local_ip,
+                connected_clients,
+                &mut outcome,
+            );
         }
     }
 
@@ -247,6 +359,7 @@ fn render_sound_editor_modal(
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
+        .frame(themed_modal_frame(ctx, &config.theme))
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
         .fixed_size(Vec2::new(455.0, 325.0))
         .show(ctx, |ui| {
@@ -391,7 +504,7 @@ fn render_sound_editor_modal(
                         || hotkeys::parse_shortcut(&draft.shortcut_input).is_ok();
                     let can_save = draft.audio_path.is_some() && shortcut_valid;
                     if ui
-                        .add_enabled(can_save, egui::Button::new("Save Sound"))
+                        .add_enabled(can_save, primary_accent_button("Save Sound", &config.theme))
                         .clicked()
                     {
                         outcome.save_sound = Some(draft.clone());
@@ -501,8 +614,9 @@ fn render_settings_modal(
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
+        .frame(themed_modal_frame(ctx, &config.theme))
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .default_size(Vec2::new(520.0, 460.0))
+        .default_size(Vec2::new(530.0, 470.0))
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // --- Section 1: Audio Routing Devices ---
@@ -639,15 +753,30 @@ fn render_settings_modal(
                 }
 
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Apply & Restart Streams").clicked() {
+                let data_err_id = egui::Id::new("wawefx_open_data_dir_err");
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add(primary_accent_button("Apply & Restart Streams", &config.theme))
+                        .clicked()
+                    {
                         outcome.apply_audio_config = true;
                         outcome.config_dirty = true;
                     }
                     if ui.button("Refresh & Apply Devices").clicked() {
                         outcome.refresh_and_apply_devices = true;
                     }
+                    if ui
+                        .button("Open Data Folder")
+                        .on_hover_text(format!("Open {}", AppConfig::data_dir().display()))
+                        .clicked()
+                    {
+                        let res = AppConfig::open_data_folder().err().map(|e| format!("{e:#}"));
+                        ctx.data_mut(|d| d.insert_temp(data_err_id, res));
+                    }
                 });
+                if let Some(err) = ctx.data_mut(|d| d.get_temp::<Option<String>>(data_err_id).flatten()) {
+                    ui.colored_label(Color32::from_rgb(220, 70, 70), err);
+                }
 
                 ui.add_space(12.0);
                 ui.separator();
@@ -788,7 +917,7 @@ fn render_settings_modal(
                         outcome.config_dirty = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Done").clicked() {
+                        if ui.add(primary_accent_button("Done", &config.theme)).clicked() {
                             outcome.close_modal = true;
                         }
                     });
@@ -836,6 +965,7 @@ fn color_row(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
 
 fn render_alerts_modal(
     ctx: &egui::Context,
+    theme: &ThemeConfig,
     status: &AudioEngineStatus,
     hotkey_status: &HotkeyStatus,
     devices: &AudioDeviceList,
@@ -851,6 +981,7 @@ fn render_alerts_modal(
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
+        .frame(themed_modal_frame(ctx, theme))
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
         .default_size(Vec2::new(510.0, if missing_virtual_driver { 440.0 } else { 350.0 }))
         .show(ctx, |ui| {
@@ -943,7 +1074,10 @@ fn render_alerts_modal(
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Open Audio Settings").clicked() {
+                    if ui
+                        .add(primary_accent_button("Open Audio Settings", theme))
+                        .clicked()
+                    {
                         outcome.open_settings = true;
                     }
                     if ui.button("Refresh & Apply Devices").clicked() {
@@ -1064,6 +1198,7 @@ fn render_virtual_driver_setup_banner(
 
 fn render_companion_modal(
     ctx: &egui::Context,
+    theme: &ThemeConfig,
     sync_port: u16,
     local_ip: &str,
     connected_clients: usize,
@@ -1080,8 +1215,9 @@ fn render_companion_modal(
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
+        .frame(themed_modal_frame(ctx, theme))
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .fixed_size(Vec2::new(340.0, 360.0))
+        .fixed_size(Vec2::new(340.0, 365.0))
         .show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.label("Scan on your phone to open the live remote:");

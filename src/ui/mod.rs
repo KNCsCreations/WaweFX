@@ -10,10 +10,12 @@ use std::time::Duration;
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use image::ImageReader;
+#[cfg(any(not(target_os = "macos"), test))]
 use image::imageops::FilterType;
 use uuid::Uuid;
 
 /// Embedded WaweFX brand logo PNG bytes compiled directly into the standalone binary.
+#[cfg(any(not(target_os = "macos"), test))]
 pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../assets/logo.png");
 
 use crate::audio::{AudioDeviceList, AudioEngine};
@@ -93,10 +95,10 @@ impl ThumbnailLoader {
 
     /// Returns a cached texture if ready, or schedules an async background decode if missing.
     pub fn texture_for(&mut self, ctx: &egui::Context, sound: &SoundItem) -> Option<&TextureHandle> {
-        let path = sound.image_path.as_ref()?;
+        let path = sound.resolved_image_path()?;
 
         if let Some((cached_path, _)) = self.textures.get(&sound.id) {
-            if cached_path == path {
+            if *cached_path == path {
                 return self.textures.get(&sound.id).map(|(_, h)| h);
             }
             self.textures.remove(&sound.id);
@@ -108,7 +110,7 @@ impl ThumbnailLoader {
                 self.pending.insert(key);
                 let _ = self.req_tx.send(DecodeRequest {
                     sound_id: sound.id.clone(),
-                    path: path.clone(),
+                    path,
                     ctx: ctx.clone(),
                 });
             } else {
@@ -142,7 +144,8 @@ fn decode_thumbnail_image(path: &Path) -> Option<ColorImage> {
 }
 
 /// Decodes the embedded `assets/logo.png` into a 256x256 RGBA [`egui::IconData`] for the
-/// application window titlebar, Windows Taskbar, and macOS Dock.
+/// application window titlebar and Windows Taskbar.
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn build_window_icon() -> egui::IconData {
     if let Ok(decoded) = image::load_from_memory(LOGO_PNG_BYTES) {
         let resized = decoded
@@ -222,6 +225,13 @@ impl WaweFxApp {
         if self.audio.active_sound_id().as_deref() == Some(sound_id) {
             self.audio.stop();
         }
+        let removed_assets = self
+            .config
+            .sounds
+            .iter()
+            .find(|s| s.id == sound_id)
+            .map(|s| (s.audio_path.clone(), s.image_path.clone()));
+
         self.audio.invalidate_cached_sound(sound_id);
         self.thumbnails.invalidate(sound_id);
         self.sync.invalidate_thumbnail(sound_id);
@@ -229,14 +239,39 @@ impl WaweFxApp {
         if self.config.selected_sound_id.as_deref() == Some(sound_id) {
             self.config.selected_sound_id = self.config.sounds.first().map(|s| s.id.clone());
         }
+
+        if let Some((audio_path, image_path)) = removed_assets {
+            self.config.cleanup_managed_path(&audio_path);
+            if let Some(img) = image_path {
+                self.config.cleanup_managed_path(&img);
+            }
+        }
     }
 
     fn apply_saved_sound(&mut self, draft: SoundModalDraft) {
-        let Some(audio_path) = draft.audio_path else {
+        let Some(selected_audio) = draft.audio_path else {
             return;
         };
+        let audio_path = match AppConfig::import_sound_file(&selected_audio) {
+            Ok(rel) => rel,
+            Err(err) => {
+                self.last_error = Some(format!("Failed to copy sound into WaweFX data folder: {err:#}"));
+                return;
+            }
+        };
+        let image_path = match draft.image_path {
+            Some(ref selected_img) => match AppConfig::import_cover_file(selected_img) {
+                Ok(rel) => Some(rel),
+                Err(err) => {
+                    self.last_error = Some(format!("Failed to copy cover image into WaweFX data folder: {err:#}"));
+                    None
+                }
+            },
+            None => None,
+        };
+
         let title = if draft.title.trim().is_empty() {
-            audio_path
+            selected_audio
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "Untitled Sound".to_string())
@@ -256,12 +291,17 @@ impl WaweFxApp {
                 self.config
                     .unbind_shortcut_conflicts(sc, Some(&edit_id), false);
             }
+            let mut old_paths: Option<(PathBuf, Option<PathBuf>)> = None;
             if let Some(existing) = self.config.sounds.iter_mut().find(|s| s.id == edit_id) {
                 let audio_changed = existing.audio_path != audio_path;
-                let image_changed = existing.image_path != draft.image_path;
+                let image_changed = existing.image_path != image_path;
+                old_paths = Some((
+                    if audio_changed { existing.audio_path.clone() } else { PathBuf::new() },
+                    if image_changed { existing.image_path.clone() } else { None },
+                ));
                 existing.title = title;
                 existing.audio_path = audio_path;
-                existing.image_path = draft.image_path;
+                existing.image_path = image_path;
                 existing.duration_secs = draft.duration_secs;
                 existing.volume_trim = draft.volume_trim;
                 existing.shortcut = normalized_shortcut;
@@ -271,6 +311,12 @@ impl WaweFxApp {
                 if image_changed {
                     self.thumbnails.invalidate(&edit_id);
                     self.sync.invalidate_thumbnail(&edit_id);
+                }
+            }
+            if let Some((old_audio, old_img)) = old_paths {
+                self.config.cleanup_managed_path(&old_audio);
+                if let Some(img) = old_img {
+                    self.config.cleanup_managed_path(&img);
                 }
             }
         } else {
@@ -283,7 +329,7 @@ impl WaweFxApp {
                 id: new_id.clone(),
                 title,
                 audio_path,
-                image_path: draft.image_path,
+                image_path,
                 duration_secs: draft.duration_secs,
                 volume_trim: draft.volume_trim,
                 shortcut: normalized_shortcut,
@@ -296,6 +342,7 @@ impl WaweFxApp {
 
 impl eframe::App for WaweFxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        modals::apply_theme_visuals(ctx, &self.config.theme);
         self.sync.register_egui_ctx(ctx.clone());
         self.thumbnails.poll(ctx);
 
@@ -667,11 +714,21 @@ impl WaweFxApp {
                             .filter(|s| !s.trim().is_empty())
                             .unwrap_or("New Sound")
                             .to_string();
-                        let item = SoundItem::new(title, path, None, duration_secs);
-                        self.config.selected_sound_id = Some(item.id.clone());
-                        self.config.sounds.push(item);
-                        self.last_error = None;
-                        changed = true;
+                        match AppConfig::import_sound_file(&path) {
+                            Ok(managed_audio) => {
+                                let item = SoundItem::new(title, managed_audio, None, duration_secs);
+                                self.config.selected_sound_id = Some(item.id.clone());
+                                self.config.sounds.push(item);
+                                self.last_error = None;
+                                changed = true;
+                            }
+                            Err(err) => {
+                                self.last_error = Some(format!(
+                                    "Failed to copy dropped audio '{}' into WaweFX data folder: {err:#}",
+                                    path.display()
+                                ));
+                            }
+                        }
                     }
                     Err(err) => {
                         self.last_error = Some(format!(
@@ -689,12 +746,34 @@ impl WaweFxApp {
                 });
 
                 if let Some(pad_id) = target_pad_id {
-                    if let Some(sound) = self.config.sounds.iter_mut().find(|s| s.id == pad_id) {
-                        sound.image_path = Some(path);
-                        self.thumbnails.invalidate(&pad_id);
-                        self.sync.invalidate_thumbnail(&pad_id);
-                        self.last_error = None;
-                        changed = true;
+                    match AppConfig::import_cover_file(&path) {
+                        Ok(managed_cover) => {
+                            let old_img = if let Some(sound) =
+                                self.config.sounds.iter_mut().find(|s| s.id == pad_id)
+                            {
+                                let prev = sound.image_path.replace(managed_cover.clone());
+                                if prev.as_ref() == Some(&managed_cover) {
+                                    None
+                                } else {
+                                    prev
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(prev_path) = old_img {
+                                self.config.cleanup_managed_path(&prev_path);
+                            }
+                            self.thumbnails.invalidate(&pad_id);
+                            self.sync.invalidate_thumbnail(&pad_id);
+                            self.last_error = None;
+                            changed = true;
+                        }
+                        Err(err) => {
+                            self.last_error = Some(format!(
+                                "Failed to copy dropped cover '{}' into WaweFX data folder: {err:#}",
+                                path.display()
+                            ));
+                        }
                     }
                 } else {
                     self.last_error = Some(
