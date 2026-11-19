@@ -4,10 +4,10 @@ use std::sync::{Arc, Mutex};
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
 use qrcode::{Color as QrColor, QrCode};
 
-use crate::audio::{AudioDeviceList, AudioEngine, AudioEngineStatus, apo_installer};
+use crate::audio::{AudioDeviceList, AudioEngine, AudioEngineStatus, PREVIEW_SOUND_ID, apo_installer};
 use crate::config::{
-    AppConfig, MAX_PITCH_STEP, MIN_PITCH_STEP, ShortcutOwner, SoundItem, ThemeConfig, ThemePreset,
-    rgb_to_color32,
+    AppConfig, MAX_PITCH_STEP, MIN_PITCH_STEP, MIN_TRIM_GAP, ShortcutOwner, SoundItem, ThemeConfig,
+    ThemePreset, rgb_to_color32, sanitize_trim_range,
 };
 use crate::hotkeys::{self, HotkeyStatus, ShortcutCapture};
 use crate::updater::{self, CURRENT_VERSION, GITHUB_REPO_SLUG, UpdateCheckState};
@@ -239,6 +239,10 @@ pub struct SoundModalDraft {
     pub image_path: Option<PathBuf>,
     pub duration_secs: f32,
     pub volume_trim: f32,
+    pub trim_start: f32,
+    pub trim_end: f32,
+    pub waveform_peaks: Option<Arc<Vec<f32>>>,
+    pub waveform_loaded_for: Option<PathBuf>,
     pub shortcut: Option<String>,
     pub shortcut_input: String,
     pub recording_shortcut: bool,
@@ -255,6 +259,10 @@ impl SoundModalDraft {
             image_path: None,
             duration_secs: 0.0,
             volume_trim: 1.0,
+            trim_start: 0.0,
+            trim_end: 1.0,
+            waveform_peaks: None,
+            waveform_loaded_for: None,
             shortcut: None,
             shortcut_input: String::new(),
             recording_shortcut: false,
@@ -264,6 +272,7 @@ impl SoundModalDraft {
     }
 
     pub fn from_existing(item: &SoundItem) -> Self {
+        let (trim_start, trim_end) = sanitize_trim_range(item.trim_start, item.trim_end);
         Self {
             editing_id: Some(item.id.clone()),
             title: item.title.clone(),
@@ -271,6 +280,10 @@ impl SoundModalDraft {
             image_path: item.image_path.clone(),
             duration_secs: item.duration_secs,
             volume_trim: item.volume_trim,
+            trim_start,
+            trim_end,
+            waveform_peaks: None,
+            waveform_loaded_for: None,
             shortcut: item.shortcut.clone(),
             shortcut_input: item.shortcut.clone().unwrap_or_default(),
             recording_shortcut: false,
@@ -304,6 +317,7 @@ pub fn render_modals(
     ctx: &egui::Context,
     modal: &mut ActiveModal,
     config: &mut AppConfig,
+    audio: &AudioEngine,
     devices: &AudioDeviceList,
     status: &AudioEngineStatus,
     hotkey_status: &HotkeyStatus,
@@ -316,7 +330,7 @@ pub fn render_modals(
 
     match modal {
         ActiveModal::SoundEditor(draft) => {
-            render_sound_editor_modal(ctx, draft, config, &mut outcome);
+            render_sound_editor_modal(ctx, draft, config, audio, &mut outcome);
         }
         ActiveModal::Settings => {
             render_settings_modal(
@@ -367,8 +381,19 @@ fn render_sound_editor_modal(
     ctx: &egui::Context,
     draft: &mut SoundModalDraft,
     config: &AppConfig,
+    audio: &AudioEngine,
     outcome: &mut ModalOutcome,
 ) {
+    if draft.audio_path.as_ref() != draft.waveform_loaded_for.as_ref() {
+        if let Some(ref path) = draft.audio_path {
+            draft.waveform_peaks = audio.waveform_peaks_for_path(path).ok();
+            draft.waveform_loaded_for = Some(path.clone());
+        } else {
+            draft.waveform_peaks = None;
+            draft.waveform_loaded_for = None;
+        }
+    }
+
     let title = if draft.editing_id.is_some() {
         "Edit Sound Properties"
     } else {
@@ -382,7 +407,8 @@ fn render_sound_editor_modal(
         .resizable(false)
         .frame(themed_modal_frame(ctx, &config.theme))
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .fixed_size(Vec2::new(455.0, 325.0))
+        .default_width(510.0)
+        .min_width(500.0)
         .show(ctx, |ui| {
             ui.add_space(4.0);
             egui::Grid::new("sound_editor_grid")
@@ -393,7 +419,7 @@ fn render_sound_editor_modal(
                     ui.add(
                         egui::TextEdit::singleline(&mut draft.title)
                             .hint_text("Sound name...")
-                            .desired_width(295.0),
+                            .desired_width(345.0),
                     );
                     ui.end_row();
 
@@ -419,9 +445,13 @@ fn render_sound_editor_modal(
                             {
                                 draft.title = stem.to_string_lossy().to_string();
                             }
-                            match AudioEngine::probe_audio_duration(&path) {
-                                Ok(secs) => {
+                            match audio.probe_audio_with_peaks(&path) {
+                                Ok((secs, peaks)) => {
                                     draft.duration_secs = secs;
+                                    draft.trim_start = 0.0;
+                                    draft.trim_end = 1.0;
+                                    draft.waveform_peaks = Some(peaks);
+                                    draft.waveform_loaded_for = Some(path.clone());
                                     draft.audio_path = Some(path);
                                     draft.error_message = None;
                                 }
@@ -458,7 +488,7 @@ fn render_sound_editor_modal(
                     });
                     ui.end_row();
 
-                    ui.label("Sound Trim:");
+                    ui.label("Sound Volume:");
                     ui.horizontal(|ui| {
                         let mut pct = draft.volume_trim * 100.0;
                         if ui
@@ -467,6 +497,12 @@ fn render_sound_editor_modal(
                         {
                             draft.volume_trim = (pct / 100.0).clamp(0.0, 2.0);
                         }
+                    });
+                    ui.end_row();
+
+                    ui.label("Sound Trim:");
+                    ui.vertical(|ui| {
+                        render_waveform_trim_editor(ui, ctx, draft, audio, &config.theme);
                     });
                     ui.end_row();
 
@@ -502,9 +538,17 @@ fn render_sound_editor_modal(
                     ui.end_row();
 
                     ui.label("Duration:");
-                    let mins = (draft.duration_secs.round() as u32) / 60;
-                    let secs = (draft.duration_secs.round() as u32) % 60;
-                    ui.label(format!("{mins:02}:{secs:02}"));
+                    let (ts, te) = sanitize_trim_range(draft.trim_start, draft.trim_end);
+                    let trimmed_total = (draft.duration_secs.max(0.0) * (te - ts)).max(0.0);
+                    let t_mins = (trimmed_total.round() as u32) / 60;
+                    let t_secs = (trimmed_total.round() as u32) % 60;
+                    if ts > 1e-4 || te < 1.0 - 1e-4 {
+                        let f_mins = (draft.duration_secs.max(0.0).round() as u32) / 60;
+                        let f_secs = (draft.duration_secs.max(0.0).round() as u32) % 60;
+                        ui.label(format!("{t_mins:02}:{t_secs:02} (full {f_mins:02}:{f_secs:02})"));
+                    } else {
+                        ui.label(format!("{t_mins:02}:{t_secs:02}"));
+                    }
                     ui.end_row();
                 });
 
@@ -543,6 +587,256 @@ fn render_sound_editor_modal(
     if !open {
         outcome.close_modal = true;
     }
+}
+
+fn format_timestamp_tenths(secs: f32) -> String {
+    let clamped = secs.max(0.0);
+    let tenths_total = (clamped * 10.0).round() as u32;
+    let mins = tenths_total / 600;
+    let whole_secs = (tenths_total / 10) % 60;
+    let tenths = tenths_total % 10;
+    format!("{mins:02}:{whole_secs:02}.{tenths}")
+}
+
+fn render_waveform_trim_editor(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    draft: &mut SoundModalDraft,
+    audio: &AudioEngine,
+    theme: &ThemeConfig,
+) {
+    let (mut trim_start, mut trim_end) = sanitize_trim_range(draft.trim_start, draft.trim_end);
+    let accent = rgb_to_color32(theme.accent_color);
+    let bg_box = rgb_to_color32(theme.bg_main);
+    let border_col = rgb_to_color32(theme.toolbar_divider);
+    let muted_bar = rgb_to_color32(theme.icon_secondary).gamma_multiply(0.45);
+    let text_col = rgb_to_color32(theme.pad_text);
+
+    let box_size = Vec2::new(350.0, 56.0);
+    let Some(ref audio_path) = draft.audio_path.clone() else {
+        let (rect, _) = ui.allocate_exact_size(box_size, egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(rect, CornerRadius::same(6), bg_box);
+        p.rect_stroke(
+            rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0_f32, border_col),
+            egui::StrokeKind::Inside,
+        );
+        p.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Select an audio file to trim waveform",
+            egui::FontId::proportional(11.0),
+            text_col.gamma_multiply(0.45),
+        );
+        return;
+    };
+
+    #[derive(Clone, Copy, PartialEq, Eq, Default)]
+    enum TrimDragHandle {
+        #[default]
+        None,
+        Start,
+        End,
+    }
+
+    let drag_id = egui::Id::new("sound_editor_trim_drag_handle");
+    let mut active_handle: TrimDragHandle =
+        ui.data(|d| d.get_temp(drag_id)).unwrap_or_default();
+
+    let (rect, resp) = ui.allocate_exact_size(box_size, egui::Sense::click_and_drag());
+    let inner_rect = rect.shrink2(Vec2::new(4.0, 4.0));
+    let start_x = inner_rect.min.x + trim_start * inner_rect.width();
+    let end_x = inner_rect.min.x + trim_end * inner_rect.width();
+
+    let pointer_x = resp
+        .interact_pointer_pos()
+        .or(resp.hover_pos())
+        .map(|p| p.x);
+
+    if (resp.drag_started() || resp.clicked())
+        && let Some(px) = resp.interact_pointer_pos().map(|p| p.x)
+    {
+        let dist_start = (px - start_x).abs();
+        let dist_end = (px - end_x).abs();
+        active_handle = if dist_start <= dist_end {
+            TrimDragHandle::Start
+        } else {
+            TrimDragHandle::End
+        };
+    }
+
+    if active_handle != TrimDragHandle::None && (resp.dragged() || resp.clicked()) {
+        if let Some(px) = resp.interact_pointer_pos().map(|p| p.x) {
+            let norm = ((px - inner_rect.min.x) / inner_rect.width().max(1.0)).clamp(0.0, 1.0);
+            match active_handle {
+                TrimDragHandle::Start => {
+                    trim_start = norm.clamp(0.0, trim_end - MIN_TRIM_GAP);
+                }
+                TrimDragHandle::End => {
+                    trim_end = norm.clamp(trim_start + MIN_TRIM_GAP, 1.0);
+                }
+                TrimDragHandle::None => {}
+            }
+            draft.trim_start = trim_start;
+            draft.trim_end = trim_end;
+        }
+    } else if !resp.dragged() {
+        active_handle = TrimDragHandle::None;
+    }
+
+    ui.data_mut(|d| d.insert_temp(drag_id, active_handle));
+
+    let near_handle = pointer_x.is_some_and(|px| {
+        (px - start_x).abs() <= 9.0 || (px - end_x).abs() <= 9.0
+    });
+    if active_handle != TrimDragHandle::None || (resp.hovered() && near_handle) {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+    }
+
+    let start_x = inner_rect.min.x + trim_start * inner_rect.width();
+    let end_x = inner_rect.min.x + trim_end * inner_rect.width();
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(6), bg_box);
+
+    // Waveform amplitude bars
+    if let Some(ref peaks) = draft.waveform_peaks
+        && !peaks.is_empty()
+    {
+        let bar_count = peaks.len();
+        let step = inner_rect.width() / bar_count as f32;
+        let bar_w = (step * 0.68).clamp(1.2, 3.0);
+        let max_h = inner_rect.height().max(4.0);
+        let cy = inner_rect.center().y;
+
+        for (i, &peak) in peaks.iter().enumerate() {
+            let cx = inner_rect.min.x + (i as f32 + 0.5) * step;
+            let bar_h = (peak.clamp(0.08, 1.0) * max_h).max(3.0);
+            let bar_rect = Rect::from_center_size(Pos2::new(cx, cy), Vec2::new(bar_w, bar_h));
+            let col = if cx >= start_x && cx <= end_x {
+                accent
+            } else {
+                muted_bar
+            };
+            painter.rect_filled(bar_rect, CornerRadius::same(1), col);
+        }
+    } else {
+        painter.line_segment(
+            [
+                Pos2::new(inner_rect.min.x, inner_rect.center().y),
+                Pos2::new(inner_rect.max.x, inner_rect.center().y),
+            ],
+            Stroke::new(1.5_f32, muted_bar),
+        );
+    }
+
+    // Dimmed dark overlays over trimmed-out outer regions
+    let overlay_col = Color32::from_black_alpha(120);
+    if start_x > rect.min.x {
+        let left_shade = Rect::from_min_max(rect.min, Pos2::new(start_x, rect.max.y));
+        painter.rect_filled(left_shade, CornerRadius::ZERO, overlay_col);
+    }
+    if end_x < rect.max.x {
+        let right_shade = Rect::from_min_max(Pos2::new(end_x, rect.min.y), rect.max);
+        painter.rect_filled(right_shade, CornerRadius::ZERO, overlay_col);
+    }
+
+    // Live preview playhead indicator when previewing inside modal
+    let is_previewing =
+        audio.is_playing() && audio.active_sound_id().as_deref() == Some(PREVIEW_SOUND_ID);
+    if is_previewing {
+        let p = audio.playback_progress().clamp(0.0, 1.0);
+        let play_norm = trim_start + p * (trim_end - trim_start);
+        let play_x = (inner_rect.min.x + play_norm * inner_rect.width())
+            .clamp(rect.min.x, rect.max.x);
+        painter.line_segment(
+            [Pos2::new(play_x, rect.min.y + 2.0), Pos2::new(play_x, rect.max.y - 2.0)],
+            Stroke::new(1.8_f32, contrast_on_accent(accent)),
+        );
+        ctx.request_repaint();
+    }
+
+    // Draggable Start & End vertical trim handles
+    for (hx, is_active_h) in [
+        (start_x, active_handle == TrimDragHandle::Start),
+        (end_x, active_handle == TrimDragHandle::End),
+    ] {
+        let handle_col = if is_active_h {
+            contrast_on_accent(accent)
+        } else {
+            text_col
+        };
+        painter.line_segment(
+            [Pos2::new(hx, rect.min.y), Pos2::new(hx, rect.max.y)],
+            Stroke::new(2.2_f32, handle_col),
+        );
+        let top_tab = Rect::from_center_size(Pos2::new(hx, rect.min.y + 6.0), Vec2::new(6.0, 12.0));
+        let bot_tab = Rect::from_center_size(Pos2::new(hx, rect.max.y - 6.0), Vec2::new(6.0, 12.0));
+        painter.rect_filled(top_tab, CornerRadius::same(2), accent);
+        painter.rect_filled(bot_tab, CornerRadius::same(2), accent);
+    }
+
+    // Outer frame stroke cleanly over overlays
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(6),
+        Stroke::new(1.0_f32, border_col),
+        egui::StrokeKind::Inside,
+    );
+
+    // Timestamps + Preview + Reset Trim controls
+    let total_secs = draft.duration_secs.max(0.0);
+    let start_secs = trim_start * total_secs;
+    let end_secs = trim_end * total_secs;
+    let trimmed_secs = (end_secs - start_secs).max(0.0);
+    let range_text = format!(
+        "{} - {} ({:.1}s)",
+        format_timestamp_tenths(start_secs),
+        format_timestamp_tenths(end_secs),
+        trimmed_secs
+    );
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.set_width(box_size.x);
+        ui.label(
+            egui::RichText::new(range_text)
+                .monospace()
+                .size(11.0)
+                .color(text_col.gamma_multiply(0.85)),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let is_trimmed = trim_start > 1e-4 || trim_end < 1.0 - 1e-4;
+            if ui
+                .add_enabled(is_trimmed, egui::Button::new("Reset Trim"))
+                .on_hover_text("Restore full audio range (0% - 100%)")
+                .clicked()
+            {
+                draft.trim_start = 0.0;
+                draft.trim_end = 1.0;
+            }
+
+            let preview_label = if is_previewing { "Stop" } else { "Preview" };
+            if ui
+                .button(preview_label)
+                .on_hover_text("Audition the trimmed audio slice")
+                .clicked()
+            {
+                if is_previewing {
+                    audio.stop();
+                } else if let Err(err) = audio.preview_trimmed_file(
+                    audio_path,
+                    draft.volume_trim,
+                    draft.trim_start,
+                    draft.trim_end,
+                ) {
+                    draft.error_message = Some(format!("Preview failed: {err}"));
+                }
+            }
+        });
+    });
 }
 
 fn blend_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> Color32 {

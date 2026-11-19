@@ -18,8 +18,10 @@ use uuid::Uuid;
 #[cfg(any(not(target_os = "macos"), test))]
 pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../assets/logo.png");
 
-use crate::audio::{AudioDeviceList, AudioEngine};
-use crate::config::{AppConfig, ShortcutOwner, SoundItem, rgb_to_color32, step_playback_speed};
+use crate::audio::{AudioDeviceList, AudioEngine, PREVIEW_SOUND_ID};
+use crate::config::{
+    AppConfig, ShortcutOwner, SoundItem, rgb_to_color32, sanitize_trim_range, step_playback_speed,
+};
 use crate::hotkeys::{HotkeyAction, HotkeyService};
 use crate::sync::{DesktopSyncNotice, SyncServerHandle};
 use crate::ui::modals::{ActiveModal, DriverSetupState, SoundModalDraft};
@@ -322,6 +324,8 @@ impl WaweFxApp {
             .filter(|s| !s.is_empty())
             .map(|s| crate::hotkeys::normalize_shortcut(s).unwrap_or_else(|_| s.to_string()));
 
+        let (trim_start, trim_end) = sanitize_trim_range(draft.trim_start, draft.trim_end);
+
         if let Some(edit_id) = draft.editing_id {
             if let Some(ref sc) = normalized_shortcut {
                 self.config
@@ -340,6 +344,8 @@ impl WaweFxApp {
                 existing.image_path = image_path;
                 existing.duration_secs = draft.duration_secs;
                 existing.volume_trim = draft.volume_trim;
+                existing.trim_start = trim_start;
+                existing.trim_end = trim_end;
                 existing.shortcut = normalized_shortcut;
                 if audio_changed {
                     self.audio.invalidate_cached_sound(&edit_id);
@@ -368,6 +374,8 @@ impl WaweFxApp {
                 image_path,
                 duration_secs: draft.duration_secs,
                 volume_trim: draft.volume_trim,
+                trim_start,
+                trim_end,
                 shortcut: normalized_shortcut,
             };
             self.config.sounds.push(new_item);
@@ -716,6 +724,7 @@ impl eframe::App for WaweFxApp {
                 ctx,
                 &mut modal,
                 &mut modal_cfg,
+                &self.audio,
                 &self.cached_devices,
                 &status,
                 self.hotkeys.status(),
@@ -761,6 +770,9 @@ impl eframe::App for WaweFxApp {
             } else if !outcome.close_modal {
                 self.active_modal = Some(modal);
             } else {
+                if self.audio.active_sound_id().as_deref() == Some(PREVIEW_SOUND_ID) {
+                    self.audio.stop();
+                }
                 ctx.request_repaint();
             }
         }

@@ -354,7 +354,7 @@ fn build_playback_tick(
         sounds
             .iter()
             .find(|s| s.id == sel_id)
-            .map(|s| s.duration_secs)
+            .map(|s| s.trimmed_duration_secs())
             .unwrap_or(0.0)
     } else {
         0.0
@@ -393,7 +393,7 @@ fn build_state_payload(
                 id: s.id.clone(),
                 title: s.title.clone(),
                 duration: s.formatted_duration(),
-                duration_secs: s.duration_secs,
+                duration_secs: s.trimmed_duration_secs(),
                 has_thumbnail: has_thumb,
                 thumbnail_url: has_thumb.then(|| format!("/api/thumbnails/{}?v={revision}", s.id)),
             }

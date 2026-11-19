@@ -2,12 +2,15 @@ pub mod apo_installer;
 pub mod mixer;
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 
-use crate::config::{AudioRoutingConfig, SoundItem};
+use crate::config::{AppConfig, AudioRoutingConfig, SoundItem, sanitize_trim_range};
+
+/// Special sound ID used while auditioning trimmed slices inside the sound editor modal.
+pub const PREVIEW_SOUND_ID: &str = "__wawefx_trim_preview__";
 
 /// Decoded and normalized stereo 48 kHz PCM audio buffer held in memory.
 #[derive(Debug, Clone)]
@@ -27,7 +30,51 @@ pub struct ActiveSoundData {
     pub title: String,
     pub samples: Arc<Vec<f32>>,
     pub frame_count: usize,
+    pub trim_start_frame: usize,
+    pub trim_end_frame: usize,
     pub volume_trim: f32,
+}
+
+impl ActiveSoundData {
+    /// Returns clamped `[start_frame, end_frame)` playback bounds with at least 1 frame when non-empty.
+    pub fn effective_frame_bounds(&self) -> (usize, usize) {
+        let total = self.frame_count.min(self.samples.len() / 2);
+        if total == 0 {
+            return (0, 0);
+        }
+        let raw_end = if self.trim_end_frame == 0 {
+            total
+        } else {
+            self.trim_end_frame.min(total)
+        };
+        let start = self.trim_start_frame.min(total.saturating_sub(1));
+        let end = raw_end.max(start + 1).min(total);
+        (start, end)
+    }
+
+    /// Returns the number of active frames in the `[trim_start_frame, trim_end_frame)` slice.
+    pub fn trimmed_frame_count(&self) -> usize {
+        let (start, end) = self.effective_frame_bounds();
+        end.saturating_sub(start)
+    }
+}
+
+/// Converts normalized `trim_start..trim_end` fractions into `[start_frame, end_frame)` frame bounds.
+pub fn compute_trim_frame_bounds(
+    frame_count: usize,
+    trim_start: f32,
+    trim_end: f32,
+) -> (usize, usize) {
+    if frame_count == 0 {
+        return (0, 0);
+    }
+    let (norm_s, norm_e) = sanitize_trim_range(trim_start, trim_end);
+    let start = ((norm_s as f64 * frame_count as f64).round() as usize)
+        .min(frame_count.saturating_sub(1));
+    let end = ((norm_e as f64 * frame_count as f64).round() as usize)
+        .max(start + 1)
+        .min(frame_count);
+    (start, end)
 }
 
 pub type ActiveSound = Arc<ActiveSoundData>;
@@ -88,6 +135,8 @@ pub trait AudioBackend: Send + Sync {
 pub struct AudioEngine {
     backend: Arc<dyn AudioBackend>,
     decoded_cache: Arc<RwLock<HashMap<String, DecodedSoundBuffer>>>,
+    waveform_cache: Arc<RwLock<HashMap<PathBuf, Arc<Vec<f32>>>>>,
+    last_preview_buffer: Arc<Mutex<Option<(PathBuf, DecodedSoundBuffer)>>>,
 }
 
 impl AudioEngine {
@@ -103,6 +152,8 @@ impl AudioEngine {
         Self {
             backend,
             decoded_cache: Arc::new(RwLock::new(HashMap::new())),
+            waveform_cache: Arc::new(RwLock::new(HashMap::new())),
+            last_preview_buffer: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -112,12 +163,96 @@ impl AudioEngine {
         Ok(decoded.duration_secs)
     }
 
+    /// Probes an audio file's duration and downsampled waveform peaks, caching both peaks and preview PCM.
+    pub fn probe_audio_with_peaks(&self, path: &Path) -> Result<(f32, Arc<Vec<f32>>)> {
+        let resolved = AppConfig::resolve_asset_path(path);
+        let decoded = mixer::decode_audio_file(&resolved)?;
+        let duration = decoded.duration_secs;
+        let peaks = Arc::new(mixer::compute_waveform_peaks(
+            &decoded.samples,
+            mixer::WAVEFORM_BAR_COUNT,
+        ));
+        if let Ok(mut wf_guard) = self.waveform_cache.write() {
+            wf_guard.insert(resolved.clone(), Arc::clone(&peaks));
+        }
+        if let Ok(mut prev_guard) = self.last_preview_buffer.lock() {
+            *prev_guard = Some((resolved, decoded));
+        }
+        Ok((duration, peaks))
+    }
+
+    /// Returns cached downsampled waveform peaks for `path`, decoding once if not cached yet.
+    pub fn waveform_peaks_for_path(&self, path: &Path) -> Result<Arc<Vec<f32>>> {
+        let resolved = AppConfig::resolve_asset_path(path);
+        if let Some(cached) = self
+            .waveform_cache
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(&resolved).cloned())
+        {
+            return Ok(cached);
+        }
+        let (_, peaks) = self.probe_audio_with_peaks(&resolved)?;
+        Ok(peaks)
+    }
+
+    /// Previews a trimmed `[trim_start, trim_end]` slice directly from `path` inside the editor modal.
+    pub fn preview_trimmed_file(
+        &self,
+        path: &Path,
+        volume_trim: f32,
+        trim_start: f32,
+        trim_end: f32,
+    ) -> Result<()> {
+        let resolved = AppConfig::resolve_asset_path(path);
+        let buffer = if let Some(cached) = self
+            .last_preview_buffer
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .filter(|(p, _)| p == &resolved)
+                    .map(|(_, b)| b.clone())
+            }) {
+            cached
+        } else {
+            let decoded = mixer::decode_audio_file(&resolved)?;
+            if let Ok(mut prev_guard) = self.last_preview_buffer.lock() {
+                *prev_guard = Some((resolved.clone(), decoded.clone()));
+            }
+            decoded
+        };
+
+        let (trim_start_frame, trim_end_frame) =
+            compute_trim_frame_bounds(buffer.frame_count, trim_start, trim_end);
+        let active = Arc::new(ActiveSoundData {
+            id: PREVIEW_SOUND_ID.to_string(),
+            title: "Trim Preview".to_string(),
+            samples: buffer.samples,
+            frame_count: buffer.frame_count,
+            trim_start_frame,
+            trim_end_frame,
+            volume_trim: volume_trim.clamp(0.0, 2.0),
+        });
+        self.stop();
+        self.backend.play_sound(active);
+        Ok(())
+    }
+
     /// Decodes a [`SoundItem`] offline into a 48 kHz stereo buffer and stores it in the cache.
     pub fn decode_and_cache(&self, sound: &SoundItem) -> Result<DecodedSoundBuffer> {
         let resolved_path = sound.resolved_audio_path();
         let decoded = mixer::decode_audio_file(&resolved_path)?;
         if let Ok(mut guard) = self.decoded_cache.write() {
             guard.insert(sound.id.clone(), decoded.clone());
+        }
+        let peaks = Arc::new(mixer::compute_waveform_peaks(
+            &decoded.samples,
+            mixer::WAVEFORM_BAR_COUNT,
+        ));
+        if let Ok(mut wf_guard) = self.waveform_cache.write() {
+            wf_guard.entry(resolved_path).or_insert(peaks);
         }
         Ok(decoded)
     }
@@ -142,11 +277,16 @@ impl AudioEngine {
             None => self.decode_and_cache(sound)?,
         };
 
+        let (trim_start_frame, trim_end_frame) =
+            compute_trim_frame_bounds(buffer.frame_count, sound.trim_start, sound.trim_end);
+
         let active = Arc::new(ActiveSoundData {
             id: sound.id.clone(),
             title: sound.title.clone(),
             samples: buffer.samples,
             frame_count: buffer.frame_count,
+            trim_start_frame,
+            trim_end_frame,
             volume_trim: sound.volume_trim,
         });
         self.backend.play_sound(active);

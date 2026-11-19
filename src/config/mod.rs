@@ -44,6 +44,36 @@ pub fn step_playback_speed(current: f32, delta: f32) -> f32 {
 pub const MIN_STREAM_VOLUME: f32 = 0.0;
 pub const MAX_STREAM_VOLUME: f32 = 2.0;
 
+/// Minimum normalized gap enforced between `trim_start` and `trim_end`.
+pub const MIN_TRIM_GAP: f32 = 0.02;
+
+fn default_one() -> f32 {
+    1.0
+}
+
+/// Clamps normalized trim bounds to `[0.0, 1.0]` while preserving at least [`MIN_TRIM_GAP`].
+pub fn sanitize_trim_range(start: f32, end: f32) -> (f32, f32) {
+    let mut s = if start.is_finite() {
+        start.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut e = if end.is_finite() {
+        end.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if e - s < MIN_TRIM_GAP {
+        if s + MIN_TRIM_GAP <= 1.0 {
+            e = (s + MIN_TRIM_GAP).min(1.0);
+        } else {
+            e = 1.0;
+            s = (1.0 - MIN_TRIM_GAP).max(0.0);
+        }
+    }
+    (s, e)
+}
+
 /// Represents a single sound pad entry on the WaweFX soundboard.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -54,6 +84,10 @@ pub struct SoundItem {
     pub image_path: Option<PathBuf>,
     pub duration_secs: f32,
     pub volume_trim: f32,
+    #[serde(default)]
+    pub trim_start: f32,
+    #[serde(default = "default_one")]
+    pub trim_end: f32,
     pub shortcut: Option<String>,
 }
 
@@ -66,6 +100,8 @@ impl Default for SoundItem {
             image_path: None,
             duration_secs: 0.0,
             volume_trim: 1.0,
+            trim_start: 0.0,
+            trim_end: 1.0,
             shortcut: None,
         }
     }
@@ -86,13 +122,21 @@ impl SoundItem {
             image_path,
             duration_secs: duration_secs.max(0.0),
             volume_trim: 1.0,
+            trim_start: 0.0,
+            trim_end: 1.0,
             shortcut: None,
         }
     }
 
-    /// Formats the sound duration as `MM:SS` for display on pad cards and mobile clients.
+    /// Returns the active trimmed duration (seconds) after applying `trim_start..trim_end`.
+    pub fn trimmed_duration_secs(&self) -> f32 {
+        let (start, end) = sanitize_trim_range(self.trim_start, self.trim_end);
+        (self.duration_secs.max(0.0) * (end - start)).max(0.0)
+    }
+
+    /// Formats the trimmed sound duration as `MM:SS` for display on pad cards and mobile clients.
     pub fn formatted_duration(&self) -> String {
-        let total_secs = self.duration_secs.max(0.0).round() as u32;
+        let total_secs = self.trimmed_duration_secs().round() as u32;
         let minutes = total_secs / 60;
         let seconds = total_secs % 60;
         format!("{minutes:02}:{seconds:02}")
@@ -785,6 +829,9 @@ impl AppConfig {
         for sound in &mut self.sounds {
             sound.duration_secs = sound.duration_secs.max(0.0);
             sound.volume_trim = sound.volume_trim.clamp(0.0, 2.0);
+            let (trim_start, trim_end) = sanitize_trim_range(sound.trim_start, sound.trim_end);
+            sound.trim_start = trim_start;
+            sound.trim_end = trim_end;
         }
         if let Some(selected) = &self.selected_sound_id
             && !self.sounds.iter().any(|s| &s.id == selected)
@@ -975,14 +1022,20 @@ mod tests {
         cfg.audio.mic_volume = -1.0;
         cfg.audio.headphones_volume = 3.5;
 
-        let sound = SoundItem::new(
+        let mut sound = SoundItem::new(
             "Airhorn",
             PathBuf::from("sounds/airhorn.wav"),
             Some(PathBuf::from("images/airhorn.png")),
             12.4,
         );
         let id = sound.id.clone();
+        assert_eq!(sound.trim_start, 0.0);
+        assert_eq!(sound.trim_end, 1.0);
         assert_eq!(sound.formatted_duration(), "00:12");
+        sound.trim_start = 0.25;
+        sound.trim_end = 0.75;
+        assert!((sound.trimmed_duration_secs() - 6.2).abs() < 1e-4);
+        assert_eq!(sound.formatted_duration(), "00:06");
         cfg.sounds.push(sound);
         cfg.selected_sound_id = Some(id.clone());
 
@@ -999,6 +1052,12 @@ mod tests {
         assert_eq!(loaded.selected_sound_id.as_deref(), Some(id.as_str()));
         assert_eq!(loaded.sounds.len(), 1);
         assert_eq!(loaded.sounds[0].title, "Airhorn");
+        assert!((loaded.sounds[0].trim_start - 0.25).abs() < 1e-6);
+        assert!((loaded.sounds[0].trim_end - 0.75).abs() < 1e-6);
+
+        let (clamped_s, clamped_e) = sanitize_trim_range(0.995, 0.996);
+        assert!((clamped_e - clamped_s - MIN_TRIM_GAP).abs() < 1e-6);
+        assert!((clamped_e - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1039,6 +1098,8 @@ mod tests {
         assert!(parsed.user_presets.is_empty());
         assert!((parsed.audio.pitch_step - DEFAULT_PITCH_STEP).abs() < 1e-6);
         assert_eq!(parsed.sounds[0].shortcut, None);
+        assert_eq!(parsed.sounds[0].trim_start, 0.0);
+        assert_eq!(parsed.sounds[0].trim_end, 1.0);
 
         let mut cfg = AppConfig::default();
         let mut s1 = SoundItem::new("Horn", PathBuf::from("a.wav"), None, 1.0);

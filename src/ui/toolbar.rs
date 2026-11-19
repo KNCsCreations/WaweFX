@@ -463,7 +463,7 @@ fn paint_timeline_seek_bar(
             .sounds
             .iter()
             .find(|s| s.id == sel_id)
-            .map(|s| s.duration_secs)
+            .map(|s| s.trimmed_duration_secs())
             .unwrap_or(0.0)
     } else {
         0.0

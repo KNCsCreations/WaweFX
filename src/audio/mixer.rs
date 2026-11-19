@@ -371,19 +371,68 @@ fn normalize_to_stereo_48k_into(
     }
 }
 
-/// Samples a normalized stereo `f32` buffer at fractional frame `frame_pos` using linear interpolation.
+/// Default number of amplitude bars computed for the modal waveform trim visualizer.
+pub const WAVEFORM_BAR_COUNT: usize = 120;
+
+/// Downsamples interleaved stereo PCM (`L, R`) into `num_bars` normalized `0.0..=1.0` peak amplitudes.
+pub fn compute_waveform_peaks(samples: &[f32], num_bars: usize) -> Vec<f32> {
+    if num_bars == 0 {
+        return Vec::new();
+    }
+    let total_frames = samples.len() / 2;
+    if total_frames == 0 {
+        return vec![0.0; num_bars];
+    }
+
+    let mut peaks = Vec::with_capacity(num_bars);
+    let mut global_max = 0.0f32;
+
+    for bar in 0..num_bars {
+        let start_frame = (bar * total_frames) / num_bars;
+        let mut end_frame = ((bar + 1) * total_frames) / num_bars;
+        if end_frame <= start_frame {
+            end_frame = (start_frame + 1).min(total_frames);
+        }
+
+        let mut bucket_peak = 0.0f32;
+        for frame in start_frame..end_frame {
+            let base = frame * 2;
+            let amp = samples[base].abs().max(samples[base + 1].abs());
+            if amp > bucket_peak {
+                bucket_peak = amp;
+            }
+        }
+        if bucket_peak > global_max {
+            global_max = bucket_peak;
+        }
+        peaks.push(bucket_peak);
+    }
+
+    if global_max > 1e-6 {
+        for peak in &mut peaks {
+            *peak = (*peak / global_max).clamp(0.0, 1.0);
+        }
+    }
+    peaks
+}
+
+/// Samples a normalized stereo `f32` buffer at fractional frame `frame_pos` clamped to `[0, end_frame)`.
 #[inline]
-pub fn sample_stereo_linear(samples: &[f32], frame_pos: f64) -> Option<(f32, f32)> {
-    let frame_count = samples.len() / 2;
-    if frame_count == 0 || frame_pos < 0.0 {
+pub fn sample_stereo_linear_bounded(
+    samples: &[f32],
+    frame_pos: f64,
+    end_frame: usize,
+) -> Option<(f32, f32)> {
+    let clamped_end = end_frame.min(samples.len() / 2);
+    if clamped_end == 0 || frame_pos < 0.0 || frame_pos >= clamped_end as f64 {
         return None;
     }
 
     let idx0 = frame_pos.floor() as usize;
-    if idx0 >= frame_count {
+    if idx0 >= clamped_end {
         return None;
     }
-    let idx1 = (idx0 + 1).min(frame_count - 1);
+    let idx1 = (idx0 + 1).min(clamped_end - 1);
     let frac = (frame_pos - idx0 as f64) as f32;
 
     let base0 = idx0 * 2;
@@ -391,6 +440,12 @@ pub fn sample_stereo_linear(samples: &[f32], frame_pos: f64) -> Option<(f32, f32
     let l = samples[base0] + frac * (samples[base1] - samples[base0]);
     let r = samples[base0 + 1] + frac * (samples[base1 + 1] - samples[base0 + 1]);
     Some((l, r))
+}
+
+/// Samples a normalized stereo `f32` buffer at fractional frame `frame_pos` using linear interpolation.
+#[inline]
+pub fn sample_stereo_linear(samples: &[f32], frame_pos: f64) -> Option<(f32, f32)> {
+    sample_stereo_linear_bounded(samples, frame_pos, samples.len() / 2)
 }
 
 #[inline]
@@ -517,6 +572,8 @@ struct QueuedTrack {
 struct LocalMixerTrack {
     instance_id: u64,
     sound: ActiveSound,
+    start_frame: usize,
+    end_frame: usize,
     pos_frames: f64,
     finished: bool,
 }
@@ -546,11 +603,14 @@ impl StreamTrackState {
         {
             for entry in guard.iter() {
                 if entry.instance_id > self.local_last_instance_id {
+                    let (start_frame, end_frame) = entry.sound.effective_frame_bounds();
                     self.local_tracks.push(LocalMixerTrack {
                         instance_id: entry.instance_id,
                         sound: Arc::clone(&entry.sound),
-                        pos_frames: 0.0,
-                        finished: false,
+                        start_frame,
+                        end_frame,
+                        pos_frames: start_frame as f64,
+                        finished: start_frame >= end_frame,
                     });
                     self.local_last_instance_id = entry.instance_id;
                 }
@@ -565,9 +625,11 @@ impl StreamTrackState {
 
         let se = shared.seek_epoch.load(Ordering::Acquire);
         if se != self.local_seek_epoch {
-            let target = f64::from_bits(shared.seek_target_frames_bits.load(Ordering::Acquire));
+            let rel_target = f64::from_bits(shared.seek_target_frames_bits.load(Ordering::Acquire));
             if let Some(primary) = self.local_tracks.last_mut() {
-                primary.pos_frames = target;
+                let max_pos = primary.end_frame.saturating_sub(1).max(primary.start_frame) as f64;
+                primary.pos_frames =
+                    (primary.start_frame as f64 + rel_target).clamp(primary.start_frame as f64, max_pos);
             }
             self.local_seek_epoch = se;
         }
@@ -577,7 +639,11 @@ impl StreamTrackState {
         let mut mix_l = 0.0f32;
         let mut mix_r = 0.0f32;
         for track in &mut self.local_tracks {
-            if let Some((l, r)) = sample_stereo_linear(&track.sound.samples, track.pos_frames) {
+            if let Some((l, r)) = sample_stereo_linear_bounded(
+                &track.sound.samples,
+                track.pos_frames,
+                track.end_frame,
+            ) {
                 let gain = gain_scale * track.sound.volume_trim;
                 mix_l += l * gain;
                 mix_r += r * gain;
@@ -601,19 +667,21 @@ impl StreamTrackState {
             return;
         }
         if let Some(primary) = self.local_tracks.last() {
+            let trimmed_frames = primary.end_frame.saturating_sub(primary.start_frame).max(1);
             if before_primary_id != Some(primary.instance_id) {
                 shared
                     .active_frame_count
-                    .store(primary.sound.frame_count, Ordering::Release);
+                    .store(trimmed_frames, Ordering::Release);
                 if let Ok(mut id_guard) = shared.active_sound_id.try_write() {
                     *id_guard = Some(primary.sound.id.clone());
                 }
             }
-            let total = primary.sound.frame_count.max(1) as f32;
-            let progress = (primary.pos_frames as f32 / total).clamp(0.0, 1.0);
+            let rel_pos = (primary.pos_frames - primary.start_frame as f64)
+                .clamp(0.0, trimmed_frames as f64);
+            let progress = (rel_pos as f32 / trimmed_frames as f32).clamp(0.0, 1.0);
             shared
                 .playback_pos_frames_bits
-                .store(primary.pos_frames.to_bits(), Ordering::Release);
+                .store(rel_pos.to_bits(), Ordering::Release);
             shared
                 .progress_bits
                 .store(progress.to_bits(), Ordering::Release);
@@ -738,6 +806,18 @@ impl SoftwareMixerBackend {
         }
     }
 
+    /// Constructs a headless backend without spawning CPAL/audio-manager threads for deterministic tests.
+    #[cfg(test)]
+    fn new_headless(initial_config: &AudioRoutingConfig) -> Self {
+        let shared = Arc::new(SharedMixerState::new(initial_config));
+        let (tx, _rx) = mpsc::channel::<MixerCommand>();
+        Self {
+            shared,
+            tx,
+            manager_thread: None,
+        }
+    }
+
     /// Reads the shared state synchronously for fallback-mode unit testing or diagnostics.
     #[cfg(test)]
     fn shared_state(&self) -> &SharedMixerState {
@@ -773,7 +853,7 @@ impl AudioBackend for SoftwareMixerBackend {
 
     fn play_sound(&self, sound: ActiveSound) {
         let sound_id = sound.id.clone();
-        let frame_count = sound.frame_count;
+        let frame_count = sound.trimmed_frame_count();
         let allow_overlap = self.shared.allow_overlap.load(Ordering::Acquire);
         if let Ok(mut guard) = self.shared.pending_tracks.lock() {
             if !allow_overlap {
@@ -1626,6 +1706,8 @@ mod tests {
             title: "Test Tone".to_string(),
             samples: Arc::new(vec![0.1f32; frames * 2]),
             frame_count: frames,
+            trim_start_frame: 0,
+            trim_end_frame: frames,
             volume_trim: 1.0,
         });
 
@@ -1839,7 +1921,7 @@ mod tests {
     #[test]
     fn overlap_mode_layers_tracks_and_single_mode_replaces_without_affecting_mic() {
         let cfg = AudioRoutingConfig::default();
-        let backend = SoftwareMixerBackend::new(&cfg);
+        let backend = SoftwareMixerBackend::new_headless(&cfg);
         let shared = backend.shared_state();
         assert!(backend.allow_overlap());
 
@@ -1851,6 +1933,8 @@ mod tests {
             title: "Sound A".to_string(),
             samples: Arc::new(vec![0.2f32; 20]),
             frame_count: 10,
+            trim_start_frame: 0,
+            trim_end_frame: 10,
             volume_trim: 1.0,
         });
         let sound_b = Arc::new(ActiveSoundData {
@@ -1858,6 +1942,8 @@ mod tests {
             title: "Sound B".to_string(),
             samples: Arc::new(vec![0.3f32; 20]),
             frame_count: 10,
+            trim_start_frame: 0,
+            trim_end_frame: 10,
             volume_trim: 1.0,
         });
 
@@ -1887,6 +1973,96 @@ mod tests {
         assert!((single_r - 0.2).abs() < 1e-5);
         assert_eq!(shared.mic_ring.len_frames(), 32);
         assert!(shared.mic_passthrough_enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn compute_waveform_peaks_downsamples_and_normalizes() {
+        // 8 stereo frames: 4 low-amplitude frames (0.25) followed by 4 loud frames (0.50).
+        let mut samples = Vec::new();
+        for _ in 0..4 {
+            samples.push(0.25);
+            samples.push(-0.10);
+        }
+        for _ in 0..4 {
+            samples.push(0.10);
+            samples.push(-0.50);
+        }
+        let peaks = compute_waveform_peaks(&samples, 2);
+        assert_eq!(peaks.len(), 2);
+        assert!((peaks[0] - 0.5).abs() < 1e-5, "expected 0.5 normalized peak, got {}", peaks[0]);
+        assert!((peaks[1] - 1.0).abs() < 1e-5, "expected 1.0 normalized peak, got {}", peaks[1]);
+        assert_eq!(compute_waveform_peaks(&[], 4), vec![0.0; 4]);
+    }
+
+    #[test]
+    fn trimmed_playback_starts_at_trim_start_stops_at_trim_end_and_seeks_within_range() {
+        let cfg = AudioRoutingConfig::default();
+        let backend = SoftwareMixerBackend::new_headless(&cfg);
+        let shared = backend.shared_state();
+
+        // 10 stereo frames with unique left-channel index values 0.0..0.9
+        let mut samples = Vec::with_capacity(20);
+        for i in 0..10 {
+            let v = i as f32 * 0.1;
+            samples.push(v);
+            samples.push(v);
+        }
+
+        // Trim slice: frames [2, 6) => length 4 frames (values 0.2, 0.3, 0.4, 0.5)
+        let sound = Arc::new(ActiveSoundData {
+            id: "trim-test".to_string(),
+            title: "Trimmed".to_string(),
+            samples: Arc::new(samples),
+            frame_count: 10,
+            trim_start_frame: 2,
+            trim_end_frame: 6,
+            volume_trim: 1.0,
+        });
+
+        let mut stream_state = StreamTrackState::default();
+        backend.play_sound(sound);
+        stream_state.sync_from_shared(shared);
+        assert_eq!(stream_state.local_tracks.len(), 1);
+
+        // Plays frames 2, 3, 4, 5 and finishes before frame 6.
+        let mut played = Vec::new();
+        for _ in 0..5 {
+            let had_tracks = !stream_state.local_tracks.is_empty();
+            let before_primary = stream_state.local_tracks.last().map(|t| t.instance_id);
+            let (l, _) = stream_state.mix_next_frame(1.0, 1.0);
+            if !stream_state.local_tracks[0].finished {
+                played.push(l);
+            }
+            stream_state.cleanup_finished_and_update_leader(shared, true, had_tracks, before_primary);
+            if stream_state.local_tracks.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(played.len(), 4);
+        assert!((played[0] - 0.2).abs() < 1e-5);
+        assert!((played[3] - 0.5).abs() < 1e-5);
+        assert!(!backend.is_playing(), "track should stop upon reaching trim_end_frame");
+
+        // Verify seek within trimmed slice moves relative to trim_start_frame.
+        let sound2 = Arc::new(ActiveSoundData {
+            id: "trim-test-2".to_string(),
+            title: "Trimmed 2".to_string(),
+            samples: Arc::new((0..20).map(|i| (i / 2) as f32 * 0.1).collect()),
+            frame_count: 10,
+            trim_start_frame: 2,
+            trim_end_frame: 6,
+            volume_trim: 1.0,
+        });
+        backend.play_sound(sound2);
+        stream_state.sync_from_shared(shared);
+        backend.seek_to_progress(0.5);
+        stream_state.sync_from_shared(shared);
+        let (seeked_l, _) = stream_state.mix_next_frame(1.0, 1.0);
+        // Trimmed range [2, 6) has max_frame = 3 -> 0.5 * 3 = 1.5 -> frame 2 + 1.5 = 3.5 -> value 0.35
+        assert!(
+            (seeked_l - 0.35).abs() < 0.02,
+            "expected seek inside [2,6) around 0.35, got {seeked_l}"
+        );
     }
 }
 
