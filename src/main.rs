@@ -15,6 +15,7 @@ use eframe::egui;
 fn main() -> eframe::Result {
     let cfg = config::AppConfig::load_or_default();
     let audio_engine = audio::AudioEngine::new(&cfg.audio);
+    audio_engine.set_allow_overlap(cfg.allow_overlap);
     let sync_handle = sync::SyncServerHandle::start(&cfg, audio_engine.clone());
 
     let viewport = egui::ViewportBuilder::default()

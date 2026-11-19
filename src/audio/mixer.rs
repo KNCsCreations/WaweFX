@@ -490,18 +490,149 @@ struct SharedMixerState {
     measured_mic_in_fps: AtomicU32,
     measured_vmic_out_fps: AtomicU32,
     is_playing: AtomicBool,
+    allow_overlap: AtomicBool,
     scrub_paused: AtomicBool,
     progress_bits: AtomicU32,
     active_frame_count: AtomicUsize,
     playback_pos_frames_bits: AtomicU64,
+    next_instance_id: AtomicU64,
+    stop_epoch: AtomicU64,
     play_epoch: AtomicU64,
     seek_epoch: AtomicU64,
     seek_target_frames_bits: AtomicU64,
     leader_stream: AtomicU8,
-    active_sound: Mutex<Option<ActiveSound>>,
+    pending_tracks: Mutex<Vec<QueuedTrack>>,
     active_sound_id: RwLock<Option<String>>,
     mic_ring: LockFreeStereoRingBuffer,
     status: RwLock<AudioEngineStatus>,
+}
+
+#[derive(Clone)]
+struct QueuedTrack {
+    instance_id: u64,
+    sound: ActiveSound,
+}
+
+#[derive(Clone)]
+struct LocalMixerTrack {
+    instance_id: u64,
+    sound: ActiveSound,
+    pos_frames: f64,
+    finished: bool,
+}
+
+#[derive(Default)]
+struct StreamTrackState {
+    local_stop_epoch: u64,
+    local_play_epoch: u64,
+    local_seek_epoch: u64,
+    local_last_instance_id: u64,
+    local_tracks: Vec<LocalMixerTrack>,
+}
+
+impl StreamTrackState {
+    const MAX_ACTIVE_TRACKS: usize = 16;
+
+    fn sync_from_shared(&mut self, shared: &SharedMixerState) {
+        let se_stop = shared.stop_epoch.load(Ordering::Acquire);
+        if se_stop != self.local_stop_epoch {
+            self.local_tracks.clear();
+            self.local_stop_epoch = se_stop;
+        }
+
+        let pe = shared.play_epoch.load(Ordering::Acquire);
+        if pe != self.local_play_epoch
+            && let Ok(guard) = shared.pending_tracks.try_lock()
+        {
+            for entry in guard.iter() {
+                if entry.instance_id > self.local_last_instance_id {
+                    self.local_tracks.push(LocalMixerTrack {
+                        instance_id: entry.instance_id,
+                        sound: Arc::clone(&entry.sound),
+                        pos_frames: 0.0,
+                        finished: false,
+                    });
+                    self.local_last_instance_id = entry.instance_id;
+                }
+            }
+            if self.local_tracks.len() > Self::MAX_ACTIVE_TRACKS {
+                let excess = self.local_tracks.len() - Self::MAX_ACTIVE_TRACKS;
+                self.local_tracks.drain(..excess);
+            }
+            self.local_play_epoch = pe;
+            self.local_seek_epoch = shared.seek_epoch.load(Ordering::Acquire);
+        }
+
+        let se = shared.seek_epoch.load(Ordering::Acquire);
+        if se != self.local_seek_epoch {
+            let target = f64::from_bits(shared.seek_target_frames_bits.load(Ordering::Acquire));
+            if let Some(primary) = self.local_tracks.last_mut() {
+                primary.pos_frames = target;
+            }
+            self.local_seek_epoch = se;
+        }
+    }
+
+    fn mix_next_frame(&mut self, frame_step: f64, gain_scale: f32) -> (f32, f32) {
+        let mut mix_l = 0.0f32;
+        let mut mix_r = 0.0f32;
+        for track in &mut self.local_tracks {
+            if let Some((l, r)) = sample_stereo_linear(&track.sound.samples, track.pos_frames) {
+                let gain = gain_scale * track.sound.volume_trim;
+                mix_l += l * gain;
+                mix_r += r * gain;
+                track.pos_frames += frame_step;
+            } else {
+                track.finished = true;
+            }
+        }
+        (mix_l, mix_r)
+    }
+
+    fn cleanup_finished_and_update_leader(
+        &mut self,
+        shared: &SharedMixerState,
+        is_leader: bool,
+        had_tracks_before_buffer: bool,
+        before_primary_id: Option<u64>,
+    ) {
+        self.local_tracks.retain(|t| !t.finished);
+        if !is_leader || !shared.is_playing.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(primary) = self.local_tracks.last() {
+            if before_primary_id != Some(primary.instance_id) {
+                shared
+                    .active_frame_count
+                    .store(primary.sound.frame_count, Ordering::Release);
+                if let Ok(mut id_guard) = shared.active_sound_id.try_write() {
+                    *id_guard = Some(primary.sound.id.clone());
+                }
+            }
+            let total = primary.sound.frame_count.max(1) as f32;
+            let progress = (primary.pos_frames as f32 / total).clamp(0.0, 1.0);
+            shared
+                .playback_pos_frames_bits
+                .store(primary.pos_frames.to_bits(), Ordering::Release);
+            shared
+                .progress_bits
+                .store(progress.to_bits(), Ordering::Release);
+        } else if had_tracks_before_buffer
+            && shared.play_epoch.load(Ordering::Acquire) == self.local_play_epoch
+        {
+            shared.is_playing.store(false, Ordering::Release);
+            shared.active_frame_count.store(0, Ordering::Release);
+            if let Ok(mut id_guard) = shared.active_sound_id.try_write() {
+                *id_guard = None;
+            }
+            shared
+                .playback_pos_frames_bits
+                .store(0.0f64.to_bits(), Ordering::Release);
+            shared
+                .progress_bits
+                .store(0.0f32.to_bits(), Ordering::Release);
+        }
+    }
 }
 
 impl SharedMixerState {
@@ -529,15 +660,18 @@ impl SharedMixerState {
             measured_mic_in_fps: AtomicU32::new(0),
             measured_vmic_out_fps: AtomicU32::new(0),
             is_playing: AtomicBool::new(false),
+            allow_overlap: AtomicBool::new(true),
             scrub_paused: AtomicBool::new(false),
             progress_bits: AtomicU32::new(0.0f32.to_bits()),
             active_frame_count: AtomicUsize::new(0),
             playback_pos_frames_bits: AtomicU64::new(0.0f64.to_bits()),
+            next_instance_id: AtomicU64::new(1),
+            stop_epoch: AtomicU64::new(0),
             play_epoch: AtomicU64::new(0),
             seek_epoch: AtomicU64::new(0),
             seek_target_frames_bits: AtomicU64::new(0.0f64.to_bits()),
             leader_stream: AtomicU8::new(LEADER_FALLBACK),
-            active_sound: Mutex::new(None),
+            pending_tracks: Mutex::new(Vec::new()),
             active_sound_id: RwLock::new(None),
             mic_ring: LockFreeStereoRingBuffer::new(),
             status: RwLock::new(AudioEngineStatus {
@@ -640,8 +774,17 @@ impl AudioBackend for SoftwareMixerBackend {
     fn play_sound(&self, sound: ActiveSound) {
         let sound_id = sound.id.clone();
         let frame_count = sound.frame_count;
-        if let Ok(mut guard) = self.shared.active_sound.lock() {
-            *guard = Some(sound);
+        let allow_overlap = self.shared.allow_overlap.load(Ordering::Acquire);
+        if let Ok(mut guard) = self.shared.pending_tracks.lock() {
+            if !allow_overlap {
+                guard.clear();
+                self.shared.stop_epoch.fetch_add(1, Ordering::AcqRel);
+            } else if guard.len() >= 32 {
+                let excess = guard.len() - 31;
+                guard.drain(..excess);
+            }
+            let instance_id = self.shared.next_instance_id.fetch_add(1, Ordering::AcqRel);
+            guard.push(QueuedTrack { instance_id, sound });
         }
         if let Ok(mut id_guard) = self.shared.active_sound_id.write() {
             *id_guard = Some(sound_id);
@@ -667,8 +810,8 @@ impl AudioBackend for SoftwareMixerBackend {
         self.shared.is_playing.store(false, Ordering::Release);
         self.shared.scrub_paused.store(false, Ordering::Release);
         self.shared.active_frame_count.store(0, Ordering::Release);
-        if let Ok(mut guard) = self.shared.active_sound.lock() {
-            *guard = None;
+        if let Ok(mut guard) = self.shared.pending_tracks.lock() {
+            guard.clear();
         }
         if let Ok(mut id_guard) = self.shared.active_sound_id.write() {
             *id_guard = None;
@@ -682,6 +825,7 @@ impl AudioBackend for SoftwareMixerBackend {
         self.shared
             .progress_bits
             .store(0.0f32.to_bits(), Ordering::Release);
+        self.shared.stop_epoch.fetch_add(1, Ordering::AcqRel);
         self.shared.play_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -784,6 +928,14 @@ impl AudioBackend for SoftwareMixerBackend {
 
     fn headphones_enabled(&self) -> bool {
         self.shared.headphones_enabled.load(Ordering::Acquire)
+    }
+
+    fn set_allow_overlap(&self, allow: bool) {
+        self.shared.allow_overlap.store(allow, Ordering::Release);
+    }
+
+    fn allow_overlap(&self) -> bool {
+        self.shared.allow_overlap.load(Ordering::Acquire)
     }
 
     fn is_playing(&self) -> bool {
@@ -940,10 +1092,7 @@ fn audio_manager_loop(
 }
 
 fn advance_fallback_clock(shared: &SharedMixerState, dt_secs: f64) {
-    let frame_count = match shared.active_sound.try_lock() {
-        Ok(guard) => guard.as_ref().map(|s| s.frame_count).unwrap_or(0),
-        Err(_) => return,
-    };
+    let frame_count = shared.active_frame_count.load(Ordering::Acquire);
     if frame_count == 0 {
         shared.is_playing.store(false, Ordering::Release);
         return;
@@ -954,6 +1103,10 @@ fn advance_fallback_clock(shared: &SharedMixerState, dt_secs: f64) {
     let next = cur + dt_secs * TARGET_SAMPLE_RATE as f64 * speed;
     if next >= frame_count as f64 {
         shared.is_playing.store(false, Ordering::Release);
+        shared.active_frame_count.store(0, Ordering::Release);
+        if let Ok(mut id_guard) = shared.active_sound_id.try_write() {
+            *id_guard = None;
+        }
         shared
             .playback_pos_frames_bits
             .store(0.0f64.to_bits(), Ordering::Release);
@@ -1304,10 +1457,7 @@ where
     let base_rate_step = TARGET_SAMPLE_RATE as f64 / out_rate;
     let role_leader_id = role.leader_id();
 
-    let mut local_play_epoch = 0u64;
-    let mut local_seek_epoch = 0u64;
-    let mut local_sound: Option<ActiveSound> = None;
-    let mut local_pos_frames = 0.0f64;
+    let mut track_state = StreamTrackState::default();
 
     let mut mic_resampler = MicPassthroughResampler::new();
     let mut pitch_smoother = PitchSmoother::new(shared.speed() as f64, out_rate);
@@ -1316,32 +1466,17 @@ where
         .build_output_stream(
             *config,
             move |output: &mut [T], _| {
-                // 1. Check for a newly triggered sound or stop via atomic play_epoch + try_lock().
-                let pe = shared.play_epoch.load(Ordering::Acquire);
-                if pe != local_play_epoch
-                    && let Ok(guard) = shared.active_sound.try_lock()
-                {
-                    local_sound = guard.clone();
-                    local_pos_frames =
-                        f64::from_bits(shared.seek_target_frames_bits.load(Ordering::Acquire));
-                    local_play_epoch = pe;
-                    local_seek_epoch = shared.seek_epoch.load(Ordering::Acquire);
-                }
-
-                // 2. Check for seek updates (`Rewind -5s` / `FastForward +5s` / Timeline seek).
-                let se = shared.seek_epoch.load(Ordering::Acquire);
-                if se != local_seek_epoch {
-                    local_pos_frames =
-                        f64::from_bits(shared.seek_target_frames_bits.load(Ordering::Acquire));
-                    local_seek_epoch = se;
-                }
+                // 1. Synchronize active soundboard voices (stop epoch, newly triggered sounds, seek).
+                track_state.sync_from_shared(&shared);
+                let had_tracks_before_buffer = !track_state.local_tracks.is_empty();
+                let before_primary_id = track_state.local_tracks.last().map(|t| t.instance_id);
 
                 let playing_flag = shared.is_playing.load(Ordering::Acquire)
                     && !shared.scrub_paused.load(Ordering::Acquire);
                 let target_speed = shared
                     .speed()
                     .clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED) as f64;
-                if !playing_flag || local_sound.is_none() {
+                if !playing_flag || track_state.local_tracks.is_empty() {
                     pitch_smoother.snap_to(target_speed);
                 } else {
                     pitch_smoother.set_target(target_speed);
@@ -1375,34 +1510,16 @@ where
                     shared.mic_ring.clear();
                 }
 
-                for out_frame in output.chunks_exact_mut(out_channels) {
-                    let mut sound_l = 0.0f32;
-                    let mut sound_r = 0.0f32;
+                let gain_scale = if stream_enabled { stream_vol } else { 0.0 };
 
-                    if playing_flag && let Some(ref snd) = local_sound {
-                        let frame_step = pitch_smoother.next_speed() * base_rate_step;
-                        if let Some((l, r)) = sample_stereo_linear(&snd.samples, local_pos_frames) {
-                            let gain = if stream_enabled {
-                                stream_vol * snd.volume_trim
-                            } else {
-                                0.0
-                            };
-                            sound_l = l * gain;
-                            sound_r = r * gain;
-                            local_pos_frames += frame_step;
+                for out_frame in output.chunks_exact_mut(out_channels) {
+                    let (sound_l, sound_r) =
+                        if playing_flag && !track_state.local_tracks.is_empty() {
+                            let frame_step = pitch_smoother.next_speed() * base_rate_step;
+                            track_state.mix_next_frame(frame_step, gain_scale)
                         } else {
-                            local_sound = None;
-                            if is_leader {
-                                shared.is_playing.store(false, Ordering::Release);
-                                shared
-                                    .playback_pos_frames_bits
-                                    .store(0.0f64.to_bits(), Ordering::Release);
-                                shared
-                                    .progress_bits
-                                    .store(0.0f32.to_bits(), Ordering::Release);
-                            }
-                        }
-                    }
+                            (0.0, 0.0)
+                        };
 
                     // Physical mic passthrough runs strictly at 1.0x (`mic_rate / out_rate`),
                     // completely isolated from soundboard `speed`.
@@ -1427,18 +1544,12 @@ where
                     }
                 }
 
-                if is_leader && shared.is_playing.load(Ordering::Acquire)
-                    && let Some(ref snd) = local_sound
-                {
-                    let total = snd.frame_count.max(1) as f32;
-                    let progress = (local_pos_frames as f32 / total).clamp(0.0, 1.0);
-                    shared
-                        .playback_pos_frames_bits
-                        .store(local_pos_frames.to_bits(), Ordering::Release);
-                    shared
-                        .progress_bits
-                        .store(progress.to_bits(), Ordering::Release);
-                }
+                track_state.cleanup_finished_and_update_leader(
+                    &shared,
+                    is_leader,
+                    had_tracks_before_buffer,
+                    before_primary_id,
+                );
             },
             |err| {
                 tracing::warn!("Audio output stream error: {err}");
@@ -1723,6 +1834,59 @@ mod tests {
 
         smoother.snap_to(0.1);
         assert_eq!(smoother.current(), MIN_PLAYBACK_SPEED as f64);
+    }
+
+    #[test]
+    fn overlap_mode_layers_tracks_and_single_mode_replaces_without_affecting_mic() {
+        let cfg = AudioRoutingConfig::default();
+        let backend = SoftwareMixerBackend::new(&cfg);
+        let shared = backend.shared_state();
+        assert!(backend.allow_overlap());
+
+        // Populate mic ring to ensure soundboard track resets never clear mic passthrough.
+        push_mic_samples(&shared.mic_ring, &[0.25f32; 64], 2);
+
+        let sound_a = Arc::new(ActiveSoundData {
+            id: "a".to_string(),
+            title: "Sound A".to_string(),
+            samples: Arc::new(vec![0.2f32; 20]),
+            frame_count: 10,
+            volume_trim: 1.0,
+        });
+        let sound_b = Arc::new(ActiveSoundData {
+            id: "b".to_string(),
+            title: "Sound B".to_string(),
+            samples: Arc::new(vec![0.3f32; 20]),
+            frame_count: 10,
+            volume_trim: 1.0,
+        });
+
+        let mut stream_state = StreamTrackState::default();
+
+        // Overlap ON: playing A then B layers both simultaneously.
+        backend.set_allow_overlap(true);
+        backend.play_sound(Arc::clone(&sound_a));
+        backend.play_sound(Arc::clone(&sound_b));
+        stream_state.sync_from_shared(shared);
+        assert_eq!(stream_state.local_tracks.len(), 2);
+
+        let (mix_l, mix_r) = stream_state.mix_next_frame(1.0, 1.0);
+        assert!((mix_l - 0.5).abs() < 1e-5, "expected 0.2 + 0.3 = 0.5, got {mix_l}");
+        assert!((mix_r - 0.5).abs() < 1e-5, "expected 0.2 + 0.3 = 0.5, got {mix_r}");
+        assert_eq!(shared.mic_ring.len_frames(), 32);
+
+        // Overlap OFF: playing A again clears previously active tracks so only A plays.
+        backend.set_allow_overlap(false);
+        backend.play_sound(Arc::clone(&sound_a));
+        stream_state.sync_from_shared(shared);
+        assert_eq!(stream_state.local_tracks.len(), 1);
+        assert_eq!(stream_state.local_tracks[0].sound.id, "a");
+
+        let (single_l, single_r) = stream_state.mix_next_frame(1.0, 1.0);
+        assert!((single_l - 0.2).abs() < 1e-5);
+        assert!((single_r - 0.2).abs() < 1e-5);
+        assert_eq!(shared.mic_ring.len_frames(), 32);
+        assert!(shared.mic_passthrough_enabled.load(Ordering::Acquire));
     }
 }
 

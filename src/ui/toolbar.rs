@@ -20,8 +20,6 @@ pub struct ToolbarAction {
     pub edit_selected: bool,
     pub play_selected: bool,
     pub stop_playback: bool,
-    pub rewind: bool,
-    pub fast_forward: bool,
     pub seeked: bool,
     pub open_alerts: bool,
     pub open_companion: bool,
@@ -107,7 +105,7 @@ pub fn render_toolbar(
         action.edit_selected = true;
     }
 
-    // --- Transport Controls (`Play`, `Stop`, `Rewind`, `FastForward`) ---
+    // --- Transport Controls (`Play`, `Stop`, `Overlap`) ---
     let play_rect = Rect::from_min_size(Pos2::new(x0 + 118.0, y0 + 10.0), Vec2::splat(25.0));
     let play_fill = if is_playing { accent } else { icon_primary };
     if paint_circle_icon_button(ui, "tb_play", play_rect, play_fill, bg_toolbar, "Play Selected Sound", |p, c, bg| {
@@ -131,21 +129,39 @@ pub fn render_toolbar(
         action.stop_playback = true;
     }
 
-    let rw_rect = Rect::from_min_size(Pos2::new(x0 + 180.0, y0 + 14.0), Vec2::new(25.0, 17.0));
-    if paint_double_arrow_button(ui, "tb_rw", rw_rect, icon_secondary, true, "Rewind (-5s)") {
-        action.rewind = true;
-    }
-
-    let ff_rect = Rect::from_min_size(Pos2::new(x0 + 211.0, y0 + 14.0), Vec2::new(25.0, 17.0));
-    if paint_double_arrow_button(ui, "tb_ff", ff_rect, icon_secondary, false, "Fast Forward (+5s)") {
-        action.fast_forward = true;
+    let overlap_label = if config.allow_overlap {
+        "Overlap: ON"
+    } else {
+        "Overlap: OFF"
+    };
+    let overlap_font = egui::FontId::proportional(11.0);
+    let overlap_galley = ui.painter().layout_no_wrap(
+        overlap_label.to_string(),
+        overlap_font.clone(),
+        text_color,
+    );
+    let overlap_w = (overlap_galley.size().x + 16.0).max(80.0);
+    let overlap_rect = Rect::from_min_size(Pos2::new(x0 + 184.0, y0 + 11.5), Vec2::new(overlap_w, 22.0));
+    if paint_overlap_toggle_pill(
+        ui,
+        overlap_rect,
+        config.allow_overlap,
+        overlap_label,
+        overlap_font,
+        accent,
+        icon_secondary,
+        text_color,
+    ) {
+        config.allow_overlap = !config.allow_overlap;
+        audio.set_allow_overlap(config.allow_overlap);
+        action.config_dirty = true;
     }
 
     // --- Right Cluster Anchor ---
-    let right_base = (bar_rect.max.x - 240.0).max(x0 + 280.0);
+    let right_base = (bar_rect.max.x - 240.0).max(overlap_rect.max.x + 80.0);
 
     // --- Center Horizontal Timeline / Seek Bar (+ optional Update Pill Badge) ---
-    let slider_left = (x0 + 260.0).min(right_base - 95.0);
+    let slider_left = (overlap_rect.max.x + 16.0).min(right_base - 95.0);
     let badge_right_limit = right_base - 14.0;
     let mut slider_right = (right_base - 30.0).max(slider_left + 60.0);
 
@@ -352,49 +368,76 @@ fn paint_circle_icon_button(
     resp.on_hover_text(tooltip).clicked()
 }
 
-fn paint_double_arrow_button(
+fn paint_overlap_toggle_pill(
     ui: &mut egui::Ui,
-    id: &str,
     rect: Rect,
-    color: Color32,
-    left_pointing: bool,
-    tooltip: &str,
+    allow_overlap: bool,
+    label: &str,
+    font: egui::FontId,
+    accent: Color32,
+    icon_secondary: Color32,
+    text_color: Color32,
 ) -> bool {
-    let resp = ui.interact(rect, ui.id().with(id), Sense::click());
-    let painter = ui.painter();
-    let tint = if resp.hovered() {
-        brighten_color(color, 18)
+    let tooltip = if allow_overlap {
+        "Multiple sounds can play at the same time"
     } else {
-        color
+        "Playing a new sound stops the previous one"
     };
+    let resp = ui
+        .interact(rect, ui.id().with("tb_overlap_toggle"), Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tooltip);
 
-    let cy = rect.center().y;
-    let half_h = 8.0;
-    let tri_w = 11.5;
+    let painter = ui.painter();
+    let rounding = CornerRadius::same(11);
 
-    if left_pointing {
-        for offset in [0.0f32, 11.5] {
-            let tip_x = rect.min.x + 1.0 + offset;
-            let pts = vec![
-                Pos2::new(tip_x, cy),
-                Pos2::new(tip_x + tri_w, cy - half_h),
-                Pos2::new(tip_x + tri_w, cy + half_h),
-            ];
-            painter.add(egui::Shape::convex_polygon(pts, tint, Stroke::NONE));
+    if allow_overlap {
+        let luma = 0.299 * accent.r() as f32 + 0.587 * accent.g() as f32 + 0.114 * accent.b() as f32;
+        let fg = if luma > 175.0 {
+            Color32::from_rgb(0x2B, 0x25, 0x20)
+        } else {
+            Color32::WHITE
+        };
+        let fill = if resp.hovered() {
+            brighten_color(accent, 14)
+        } else {
+            accent
+        };
+        painter.rect_filled(rect, rounding, fill);
+        if resp.hovered() {
+            painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, fg), StrokeKind::Inside);
         }
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, label, font, fg);
     } else {
-        for offset in [0.0f32, 11.5] {
-            let base_x = rect.min.x + 1.0 + offset;
-            let pts = vec![
-                Pos2::new(base_x, cy - half_h),
-                Pos2::new(base_x + tri_w, cy),
-                Pos2::new(base_x, cy + half_h),
-            ];
-            painter.add(egui::Shape::convex_polygon(pts, tint, Stroke::NONE));
-        }
+        let fill = Color32::from_rgba_unmultiplied(
+            icon_secondary.r(),
+            icon_secondary.g(),
+            icon_secondary.b(),
+            if resp.hovered() { 48 } else { 26 },
+        );
+        let stroke_col = Color32::from_rgba_unmultiplied(
+            icon_secondary.r(),
+            icon_secondary.g(),
+            icon_secondary.b(),
+            if resp.hovered() { 150 } else { 105 },
+        );
+        painter.rect_filled(rect, rounding, fill);
+        painter.rect_stroke(
+            rect,
+            rounding,
+            Stroke::new(1.0_f32, stroke_col),
+            StrokeKind::Inside,
+        );
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            label,
+            font,
+            text_color,
+        );
     }
 
-    resp.on_hover_text(tooltip).clicked()
+    resp.clicked()
 }
 
 fn format_mm_ss(secs: f32) -> String {

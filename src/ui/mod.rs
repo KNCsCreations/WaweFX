@@ -211,6 +211,7 @@ impl WaweFxApp {
         audio: AudioEngine,
         sync: SyncServerHandle,
     ) -> Self {
+        audio.set_allow_overlap(config.allow_overlap);
         let cached_devices = audio.available_devices();
         let local_ip = sync.local_ip();
         let last_playback_state = (audio.is_playing(), audio.active_sound_id());
@@ -446,6 +447,9 @@ impl eframe::App for WaweFxApp {
                 DesktopSyncNotice::SetHeadphonesEnabled(enabled) => {
                     self.config.audio.headphones_stream_enabled = enabled;
                 }
+                DesktopSyncNotice::SetAllowOverlap(allow) => {
+                    self.config.allow_overlap = allow;
+                }
                 DesktopSyncNotice::ReorderSounds { from, to } => {
                     if from < self.config.sounds.len()
                         && to < self.config.sounds.len()
@@ -516,14 +520,6 @@ impl eframe::App for WaweFxApp {
         }
         if tb_action.stop_playback {
             self.audio.stop();
-            sync_dirty = true;
-        }
-        if tb_action.rewind {
-            self.audio.rewind();
-            sync_dirty = true;
-        }
-        if tb_action.fast_forward {
-            self.audio.fast_forward();
             sync_dirty = true;
         }
         if tb_action.seeked {

@@ -72,6 +72,7 @@ mod windows_apo {
         headphones_volume_bits: AtomicU32,
         mic_enabled: AtomicBool,
         headphones_enabled: AtomicBool,
+        allow_overlap: AtomicBool,
     }
 
     impl Default for ApoHookBackend {
@@ -82,6 +83,7 @@ mod windows_apo {
                 headphones_volume_bits: AtomicU32::new(1.0f32.to_bits()),
                 mic_enabled: AtomicBool::new(true),
                 headphones_enabled: AtomicBool::new(true),
+                allow_overlap: AtomicBool::new(true),
             }
         }
     }
@@ -157,6 +159,14 @@ mod windows_apo {
 
         fn headphones_enabled(&self) -> bool {
             self.headphones_enabled.load(Ordering::Relaxed)
+        }
+
+        fn set_allow_overlap(&self, allow: bool) {
+            self.allow_overlap.store(allow, Ordering::Relaxed);
+        }
+
+        fn allow_overlap(&self) -> bool {
+            self.allow_overlap.load(Ordering::Relaxed)
         }
 
         fn is_playing(&self) -> bool {

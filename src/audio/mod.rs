@@ -73,6 +73,8 @@ pub trait AudioBackend: Send + Sync {
     fn mic_enabled(&self) -> bool;
     fn set_headphones_enabled(&self, enabled: bool);
     fn headphones_enabled(&self) -> bool;
+    fn set_allow_overlap(&self, allow: bool);
+    fn allow_overlap(&self) -> bool;
     fn is_playing(&self) -> bool;
     fn playback_progress(&self) -> f32;
     fn active_sound_duration_secs(&self) -> f32;
@@ -217,6 +219,14 @@ impl AudioEngine {
 
     pub fn headphones_enabled(&self) -> bool {
         self.backend.headphones_enabled()
+    }
+
+    pub fn set_allow_overlap(&self, allow: bool) {
+        self.backend.set_allow_overlap(allow);
+    }
+
+    pub fn allow_overlap(&self) -> bool {
+        self.backend.allow_overlap()
     }
 
     pub fn is_playing(&self) -> bool {

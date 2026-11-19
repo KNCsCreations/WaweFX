@@ -372,8 +372,12 @@ pub enum ShortcutOwner<'a> {
     PitchReset,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Root persistent application configuration serialized to `wawefx_config.json`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub sounds: Vec<SoundItem>,
@@ -382,9 +386,28 @@ pub struct AppConfig {
     pub pitch_up_shortcut: Option<String>,
     pub pitch_down_shortcut: Option<String>,
     pub pitch_reset_shortcut: Option<String>,
+    #[serde(default = "default_true")]
+    pub allow_overlap: bool,
     pub audio: AudioRoutingConfig,
     pub theme: ThemeConfig,
     pub user_presets: Vec<NamedTheme>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            sounds: Vec::new(),
+            selected_sound_id: None,
+            stop_shortcut: None,
+            pitch_up_shortcut: None,
+            pitch_down_shortcut: None,
+            pitch_reset_shortcut: None,
+            allow_overlap: true,
+            audio: AudioRoutingConfig::default(),
+            theme: ThemeConfig::default(),
+            user_presets: Vec::new(),
+        }
+    }
 }
 
 impl AppConfig {
@@ -946,6 +969,8 @@ mod tests {
     #[test]
     fn config_json_roundtrip_and_sanitization() {
         let mut cfg = AppConfig::default();
+        assert!(cfg.allow_overlap);
+        cfg.allow_overlap = false;
         cfg.audio.playback_speed = 9.0;
         cfg.audio.mic_volume = -1.0;
         cfg.audio.headphones_volume = 3.5;
@@ -967,6 +992,7 @@ mod tests {
         let loaded = AppConfig::load_from_path(&temp_path).expect("load test config");
         let _ = fs::remove_file(&temp_path);
 
+        assert!(!loaded.allow_overlap);
         assert_eq!(loaded.audio.playback_speed, MAX_PLAYBACK_SPEED);
         assert_eq!(loaded.audio.mic_volume, MIN_STREAM_VOLUME);
         assert_eq!(loaded.audio.headphones_volume, MAX_STREAM_VOLUME);
@@ -1005,6 +1031,7 @@ mod tests {
         }"#;
         let mut parsed: AppConfig = serde_json::from_str(legacy_json).expect("legacy json parses");
         parsed.sanitize();
+        assert!(parsed.allow_overlap);
         assert_eq!(parsed.stop_shortcut, None);
         assert_eq!(parsed.pitch_up_shortcut, None);
         assert_eq!(parsed.pitch_down_shortcut, None);

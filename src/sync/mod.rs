@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -77,6 +77,7 @@ pub struct SyncStatePayload {
     pub active_sound_id: Option<String>,
     pub selected_sound_id: Option<String>,
     pub is_playing: bool,
+    pub allow_overlap: bool,
     pub progress: f32,
     pub duration_secs: f32,
     pub speed: f32,
@@ -102,6 +103,7 @@ pub struct PlaybackTickPayload {
     pub active_sound_id: Option<String>,
     pub selected_sound_id: Option<String>,
     pub is_playing: bool,
+    pub allow_overlap: bool,
     pub progress: f32,
     pub duration_secs: f32,
     pub speed: f32,
@@ -137,6 +139,7 @@ pub enum RemoteCommand {
     },
     ToggleMic,
     ToggleHeadphones,
+    ToggleOverlap,
     Reorder {
         from: usize,
         to: usize,
@@ -164,6 +167,7 @@ pub enum DesktopSyncNotice {
     SetPitch(f32),
     SetMicEnabled(bool),
     SetHeadphonesEnabled(bool),
+    SetAllowOverlap(bool),
     ReorderSounds { from: usize, to: usize },
 }
 
@@ -178,6 +182,7 @@ struct SyncShared {
     sounds: RwLock<Vec<SoundItem>>,
     selected_sound_id: RwLock<Option<String>>,
     theme: RwLock<ThemeConfig>,
+    allow_overlap: AtomicBool,
     thumb_cache: RwLock<HashMap<String, CachedThumbBytes>>,
     latest_state: RwLock<SyncStatePayload>,
     struct_revision: AtomicU64,
@@ -190,11 +195,13 @@ struct SyncShared {
 
 impl SyncShared {
     fn new(initial_config: &AppConfig, audio: AudioEngine) -> Self {
+        audio.set_allow_overlap(initial_config.allow_overlap);
         let (broadcast_tx, _) = broadcast::channel::<String>(64);
         let initial_payload = build_state_payload(
             &initial_config.sounds,
             initial_config.selected_sound_id.clone(),
             &initial_config.theme,
+            initial_config.allow_overlap,
             &audio,
             1,
         );
@@ -204,6 +211,7 @@ impl SyncShared {
             sounds: RwLock::new(initial_config.sounds.clone()),
             selected_sound_id: RwLock::new(initial_config.selected_sound_id.clone()),
             theme: RwLock::new(initial_config.theme.clone()),
+            allow_overlap: AtomicBool::new(initial_config.allow_overlap),
             thumb_cache: RwLock::new(HashMap::new()),
             latest_state: RwLock::new(initial_payload),
             struct_revision: AtomicU64::new(1),
@@ -245,8 +253,10 @@ impl SyncShared {
             .read()
             .map(|g| g.clone())
             .unwrap_or_default();
+        let allow_overlap = self.allow_overlap.load(Ordering::Acquire);
 
-        let full_payload = build_state_payload(&sounds, selected, &theme, &self.audio, rev);
+        let full_payload =
+            build_state_payload(&sounds, selected, &theme, allow_overlap, &self.audio, rev);
         let list_payload = SoundsListPayload {
             sounds: full_payload.sounds.clone(),
             theme: full_payload.theme.clone(),
@@ -275,12 +285,14 @@ impl SyncShared {
             .read()
             .ok()
             .and_then(|g| g.clone());
-        let tick = build_playback_tick(&sounds, selected, &self.audio);
+        let allow_overlap = self.allow_overlap.load(Ordering::Acquire);
+        let tick = build_playback_tick(&sounds, selected, allow_overlap, &self.audio);
 
         if let Ok(mut guard) = self.latest_state.write() {
             guard.active_sound_id = tick.active_sound_id.clone();
             guard.selected_sound_id = tick.selected_sound_id.clone();
             guard.is_playing = tick.is_playing;
+            guard.allow_overlap = tick.allow_overlap;
             guard.progress = tick.progress;
             guard.duration_secs = tick.duration_secs;
             guard.speed = tick.speed;
@@ -301,7 +313,14 @@ impl SyncShared {
             .read()
             .map(|g| g.clone())
             .unwrap_or_else(|_| {
-                build_state_payload(&[], None, &ThemeConfig::default(), &self.audio, 0)
+                build_state_payload(
+                    &[],
+                    None,
+                    &ThemeConfig::default(),
+                    self.allow_overlap.load(Ordering::Acquire),
+                    &self.audio,
+                    0,
+                )
             });
         Ok(serde_json::to_string(&SyncEvent::StateUpdated(payload))?)
     }
@@ -312,6 +331,7 @@ fn tick_from_state(state: &SyncStatePayload) -> PlaybackTickPayload {
         active_sound_id: state.active_sound_id.clone(),
         selected_sound_id: state.selected_sound_id.clone(),
         is_playing: state.is_playing,
+        allow_overlap: state.allow_overlap,
         progress: state.progress,
         duration_secs: state.duration_secs,
         speed: state.speed,
@@ -323,6 +343,7 @@ fn tick_from_state(state: &SyncStatePayload) -> PlaybackTickPayload {
 fn build_playback_tick(
     sounds: &[SoundItem],
     selected_sound_id: Option<String>,
+    allow_overlap: bool,
     audio: &AudioEngine,
 ) -> PlaybackTickPayload {
     let is_playing = audio.is_playing();
@@ -343,6 +364,7 @@ fn build_playback_tick(
         active_sound_id,
         selected_sound_id,
         is_playing,
+        allow_overlap,
         progress: if is_playing {
             audio.playback_progress()
         } else {
@@ -359,6 +381,7 @@ fn build_state_payload(
     sounds: &[SoundItem],
     selected_sound_id: Option<String>,
     theme: &ThemeConfig,
+    allow_overlap: bool,
     audio: &AudioEngine,
     revision: u64,
 ) -> SyncStatePayload {
@@ -377,13 +400,14 @@ fn build_state_payload(
         })
         .collect();
 
-    let tick = build_playback_tick(sounds, selected_sound_id, audio);
+    let tick = build_playback_tick(sounds, selected_sound_id, allow_overlap, audio);
 
     SyncStatePayload {
         sounds: dtos,
         active_sound_id: tick.active_sound_id,
         selected_sound_id: tick.selected_sound_id,
         is_playing: tick.is_playing,
+        allow_overlap: tick.allow_overlap,
         progress: tick.progress,
         duration_secs: tick.duration_secs,
         speed: tick.speed,
@@ -503,6 +527,9 @@ impl SyncServerHandle {
                 structural_changed = true;
             }
         }
+        self.shared
+            .allow_overlap
+            .store(config.allow_overlap, Ordering::Release);
 
         if structural_changed {
             self.shared.broadcast_structural_update();
@@ -597,7 +624,14 @@ async fn serve_api_state(State(shared): State<Arc<SyncShared>>) -> Response {
         .read()
         .map(|g| g.clone())
         .unwrap_or_else(|_| {
-            build_state_payload(&[], None, &ThemeConfig::default(), &shared.audio, 0)
+            build_state_payload(
+                &[],
+                None,
+                &ThemeConfig::default(),
+                shared.allow_overlap.load(Ordering::Acquire),
+                &shared.audio,
+                0,
+            )
         });
 
     match serde_json::to_string(&payload) {
@@ -875,6 +909,13 @@ fn handle_ws_command(shared: &SyncShared, raw_json: &str) {
             shared.push_desktop_notice(DesktopSyncNotice::SetHeadphonesEnabled(next));
             shared.broadcast_playback_tick();
         }
+        RemoteCommand::ToggleOverlap => {
+            let next = !shared.allow_overlap.load(Ordering::Acquire);
+            shared.allow_overlap.store(next, Ordering::Release);
+            shared.audio.set_allow_overlap(next);
+            shared.push_desktop_notice(DesktopSyncNotice::SetAllowOverlap(next));
+            shared.broadcast_playback_tick();
+        }
         RemoteCommand::Reorder { from, to } => {
             apply_remote_reorder(shared, from, to);
         }
@@ -996,6 +1037,29 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
     background: var(--accent);
     transform: rotate(-40deg);
     border-radius: 2px;
+  }
+  .pill-toggle {
+    height: 28px;
+    padding: 0 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    background: rgba(148, 163, 184, 0.14);
+    color: var(--pad-text);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: transform 0.08s ease, background 0.15s ease, border-color 0.15s ease;
+  }
+  .pill-toggle:active { transform: scale(0.94); }
+  .pill-toggle.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #ffffff;
   }
   .conn-dot {
     width: 9px;
@@ -1259,12 +1323,7 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
           <button id="stopBtn" class="circle-btn" type="button" aria-label="Stop Playback">
             <svg width="13" height="13" viewBox="0 0 16 16" fill="currentColor"><rect x="3" y="3" width="10" height="10" rx="1.5"/></svg>
           </button>
-          <button id="rwBtn" class="icon-btn" type="button" aria-label="Rewind 5s">
-            <svg width="20" height="14" viewBox="0 0 24 16" fill="currentColor"><polygon points="11,2 2,8 11,14"/><polygon points="21,2 12,8 21,14"/></svg>
-          </button>
-          <button id="ffBtn" class="icon-btn" type="button" aria-label="Fast Forward 5s">
-            <svg width="20" height="14" viewBox="0 0 24 16" fill="currentColor"><polygon points="3,2 12,8 3,14"/><polygon points="13,2 22,8 13,14"/></svg>
-          </button>
+          <button id="overlapBtn" class="pill-toggle active" type="button" aria-label="Toggle Sound Overlap" title="Multiple sounds can play at the same time">Overlap: ON</button>
         </div>
         <div class="btn-group">
           <button id="micBtn" class="icon-btn" type="button" aria-label="Toggle Mic">
@@ -1316,8 +1375,7 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
 (() => {
   const playBtn = document.getElementById('playBtn');
   const stopBtn = document.getElementById('stopBtn');
-  const rwBtn = document.getElementById('rwBtn');
-  const ffBtn = document.getElementById('ffBtn');
+  const overlapBtn = document.getElementById('overlapBtn');
   const micBtn = document.getElementById('micBtn');
   const hpBtn = document.getElementById('hpBtn');
   const connDot = document.getElementById('connDot');
@@ -1606,6 +1664,28 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
     return m + ':' + s;
   }
 
+  let accentContrastFg = '#ffffff';
+  function computeAccentFg(hex) {
+    if (!hex || typeof hex !== 'string' || hex.length < 7 || hex[0] !== '#') return '#ffffff';
+    const r = parseInt(hex.slice(1, 3), 16);
+    const g = parseInt(hex.slice(3, 5), 16);
+    const b = parseInt(hex.slice(5, 7), 16);
+    if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return '#ffffff';
+    const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+    return luma > 175 ? '#2B2520' : '#ffffff';
+  }
+
+  let currentAllowOverlap = true;
+  function updateOverlapVisual(allow) {
+    currentAllowOverlap = allow !== false;
+    overlapBtn.classList.toggle('active', currentAllowOverlap);
+    overlapBtn.textContent = currentAllowOverlap ? 'Overlap: ON' : 'Overlap: OFF';
+    overlapBtn.title = currentAllowOverlap
+      ? 'Multiple sounds can play at the same time'
+      : 'Playing a new sound stops the previous one';
+    overlapBtn.style.color = currentAllowOverlap ? accentContrastFg : '';
+  }
+
   function applyTheme(t) {
     if (!t) return;
     const root = document.documentElement.style;
@@ -1619,6 +1699,8 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
     root.setProperty('--pad-bg', t.pad_card_bg);
     root.setProperty('--pad-hover', t.pad_card_hover);
     root.setProperty('--pad-text', t.pad_text);
+    accentContrastFg = computeAccentFg(t.accent_color);
+    updateOverlapVisual(currentAllowOverlap);
   }
 
   function updatePitchVisual(speed) {
@@ -1749,6 +1831,7 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
   function applyPlaybackTick(tick) {
     selectedSoundId = tick.selected_sound_id || null;
     playBtn.classList.toggle('playing', Boolean(tick.is_playing));
+    updateOverlapVisual(tick.allow_overlap !== false);
     micBtn.className = 'icon-btn ' + (tick.mic_enabled ? 'toggle-on' : 'toggle-muted');
     hpBtn.className = 'icon-btn ' + (tick.headphones_enabled ? 'toggle-on' : 'toggle-muted');
 
@@ -1775,8 +1858,7 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
     if (targetId) sendCmd({ cmd: 'PlaySound', id: targetId });
   });
   bindFastTap(stopBtn, () => sendCmd({ cmd: 'Stop' }));
-  bindFastTap(rwBtn, () => sendCmd({ cmd: 'Rewind' }));
-  bindFastTap(ffBtn, () => sendCmd({ cmd: 'FastForward' }));
+  bindFastTap(overlapBtn, () => sendCmd({ cmd: 'ToggleOverlap' }));
   bindFastTap(micBtn, () => sendCmd({ cmd: 'ToggleMic' }));
   bindFastTap(hpBtn, () => sendCmd({ cmd: 'ToggleHeadphones' }));
 
@@ -1922,6 +2004,9 @@ mod tests {
         let hp: RemoteCommand = serde_json::from_str(r#"{"cmd":"ToggleHeadphones"}"#).unwrap();
         assert_eq!(hp, RemoteCommand::ToggleHeadphones);
 
+        let overlap: RemoteCommand = serde_json::from_str(r#"{"cmd":"ToggleOverlap"}"#).unwrap();
+        assert_eq!(overlap, RemoteCommand::ToggleOverlap);
+
         let reorder_ws = parse_ws_command(r#"{"cmd":"Reorder","from":0,"to":2}"#).unwrap();
         assert_eq!(reorder_ws, RemoteCommand::Reorder { from: 0, to: 2 });
 
@@ -1994,6 +2079,7 @@ mod tests {
             active_sound_id: Some("1".to_string()),
             selected_sound_id: Some("1".to_string()),
             is_playing: true,
+            allow_overlap: true,
             progress: 0.5,
             duration_secs: 3.0,
             speed: 1.25,
@@ -2002,8 +2088,37 @@ mod tests {
         });
         let tick_json = serde_json::to_string(&tick_ev).unwrap();
         assert!(tick_json.contains(r#""type":"PlaybackTick""#));
+        assert!(tick_json.contains(r#""allow_overlap":true"#));
         assert!(tick_json.contains(r#""progress":0.5"#));
         assert!(!tick_json.contains("thumbnail_url"));
+    }
+
+    #[test]
+    fn remote_toggle_overlap_updates_audio_state_and_notifies_desktop() {
+        let cfg = AppConfig::default();
+        assert!(cfg.allow_overlap);
+        let engine = AudioEngine::new(&cfg.audio);
+        let shared = SyncShared::new(&cfg, engine);
+        assert!(shared.audio.allow_overlap());
+
+        handle_ws_command(&shared, r#"{"cmd":"ToggleOverlap"}"#);
+        assert!(!shared.allow_overlap.load(Ordering::Acquire));
+        assert!(!shared.audio.allow_overlap());
+        assert!(!shared.latest_state.read().unwrap().allow_overlap);
+
+        handle_ws_command(&shared, r#"{"cmd":"ToggleOverlap"}"#);
+        assert!(shared.allow_overlap.load(Ordering::Acquire));
+        assert!(shared.audio.allow_overlap());
+        assert!(shared.latest_state.read().unwrap().allow_overlap);
+
+        let notices = shared.desktop_notices.lock().unwrap();
+        assert_eq!(
+            notices.as_slice(),
+            &[
+                DesktopSyncNotice::SetAllowOverlap(false),
+                DesktopSyncNotice::SetAllowOverlap(true),
+            ]
+        );
     }
 
     #[test]
