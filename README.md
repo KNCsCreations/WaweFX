@@ -1,6 +1,6 @@
 # WaweFX
 
-**WaweFX** is a fast, lightweight, cross-platform desktop soundboard written in Rust for **Windows** and **macOS**. It features real-time virtual microphone audio mixing, live pitch/speed shifting, customizable themes, drag-and-drop pad management, and instant browser-based mobile remote control over local Wi-Fi (iOS & Android).
+**WaweFX** is a fast, lightweight, cross-platform desktop soundboard written in Rust for **Windows** and **macOS**. It features real-time virtual microphone audio mixing, live pitch/speed shifting with smooth ramp transitions, system-wide global hotkeys, customizable themes with saveable user presets, drag-and-drop pad & cover management, a self-contained AppData library, and instant browser-based mobile remote control over local Wi-Fi (iOS & Android).
 
 ---
 
@@ -27,17 +27,23 @@ Because WaweFX is currently self-distributed without a paid Apple Developer / Wi
 - **Dual-Stream Audio Routing & Mic Passthrough**
   - Mixes your physical microphone input with soundboard audio in real time via a lock-free ring buffer (`cpal` + `rodio`), outputting directly to a virtual audio cable while simultaneously monitoring through your headphones.
   - Independent rotary volume knobs (`0%–200%`) and instant mute toggles for both **Microphone Output** and **Headphones Monitoring**.
-- **Real-Time Pitch & Speed Control**
-  - Vertical pitch/speed slider (`0.5x` to `2.0x`) using click-free fractional-index resampling—changes apply instantaneously mid-playback without affecting your voice passthrough.
-  - Interactive top seek/timeline bar (`MM:SS`) with instant scrubbing, rewind (`-5s`), and fast-forward (`+5s`).
-- **Soundboard Grid & Drag-and-Drop**
-  - Supports `.mp3`, `.wav`, `.ogg`, and `.flac` audio files with custom cover thumbnails (`.png`, `.jpg`, `.webp`) decoded asynchronously on a background thread.
-  - Drag and drop sound pads to reorder them, or drop audio/image files directly from your file manager onto the window.
+- **Real-Time Pitch & Speed Control + Smooth Global Hotkeys**
+  - Vertical pitch/speed slider (`0.50x` to `2.00x`) using click-free fractional-index resampling—changes apply smoothly without affecting your voice passthrough.
+  - Bind system-wide global hotkeys (`F1–F24` + modifiers) to individual sound pads as well as **Pitch Up (`+`)**, **Pitch Down (`-`)**, and **Pitch Reset**, with a configurable step increment and smooth ramp interpolation so pitch shifts never click or pop.
+  - Interactive top seek/timeline bar (`MM:SS`) with muted scrubbing (commits cleanly on release without crackling), rewind (`-5s`), and fast-forward (`+5s`).
+- **Soundboard Grid & Drag-and-Drop (Desktop & Mobile)**
+  - Supports `.mp3`, `.wav`, `.ogg`, and `.flac` audio files with custom cover thumbnails (`.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`) decoded asynchronously on a background thread.
+  - **Drag-and-Drop Reordering**: Rearrange sound pads by dragging and dropping them on either the desktop app or the mobile web remote, with instant cross-device synchronization.
+  - **Drag-and-Drop Cover Art**: Drop any image file directly onto a sound pad card to assign its custom thumbnail.
+- **Self-Contained AppData Library**
+  - All imported audio files, custom pad covers, and `config.json` are automatically copied into your OS user data folder (`%APPDATA%\WaweFX\` on Windows, `~/Library/Application Support/WaweFX/` on macOS)—moving or deleting original files from your `Downloads` folder will never break your soundboard.
 - **Instant Mobile Remote Control (iOS & Android — No App Install Needed)**
   - Embedded `tokio` + `axum` HTTP & WebSocket server with one-click **QR code pairing**.
-  - Scanning the QR code opens a touch-optimized web soundboard in Safari or Chrome that syncs your sounds, cover images, playback state, and custom theme colors in real time.
-- **Customizable Themes**
-  - Includes built-in presets (*Classic WaweFX Lilac*, *Midnight Dark*, *Nord Frost*) plus full custom RGB color pickers persisted locally.
+  - Scanning the QR code opens a touch-optimized web soundboard in Safari or Chrome that syncs your sounds, cover images, playback state, pad order, and custom theme colors in real time.
+- **Customizable Themes & Saveable User Presets**
+  - Defaults to **Midnight Dark** alongside built-in presets (*Warm Beige*, *Nord Frost*, etc.) plus full custom RGB color pickers that you can save as named user presets and sync across desktop and mobile.
+- **Automatic Update Checker**
+  - Performs a non-blocking check against GitHub Releases on startup and displays a clickable **New version available** badge in the top toolbar whenever a newer release is published.
 
 ---
 
