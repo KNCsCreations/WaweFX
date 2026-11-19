@@ -23,10 +23,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run unit tests
-        run: cargo test --locked
+        run: cargo test
 
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build --release
 
       - name: Upload Windows executable
         uses: actions/upload-artifact@v6
@@ -51,16 +51,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check compilation without warnings
-        run: RUSTFLAGS="-D warnings" cargo check --all-targets --locked
+        run: RUSTFLAGS="-D warnings" cargo check --all-targets
 
       - name: Run unit tests
-        run: cargo test --locked
+        run: cargo test
 
       - name: Build Apple Silicon release binary
-        run: cargo build --release --locked --target aarch64-apple-darwin
+        run: cargo build --release --target aarch64-apple-darwin
 
       - name: Build Intel release binary
-        run: cargo build --release --locked --target x86_64-apple-darwin
+        run: cargo build --release --target x86_64-apple-darwin
 
       - name: Assemble WaweFX.app and package WaweFX-macOS.dmg
         shell: bash
@@ -74,7 +74,7 @@ jobs:
           cp macos/Info.plist WaweFX.app/Contents/Info.plist
           printf "APPL????" > WaweFX.app/Contents/PkgInfo
           rm -rf AppIcon.iconset
-          cargo test --locked ui::tests::generate_macos_iconset_files -- --ignored --exact
+          cargo test ui::tests::generate_macos_iconset_files -- --ignored --exact
           iconutil -c icns AppIcon.iconset -o WaweFX.app/Contents/Resources/AppIcon.icns || cp assets/icon.icns WaweFX.app/Contents/Resources/AppIcon.icns
           rm -rf AppIcon.iconset
           codesign --force --deep --sign - WaweFX.app
