@@ -476,6 +476,7 @@ fn render_sound_editor_modal(
                         ctx,
                         ui,
                         egui::Id::new("sound_editor_shortcut"),
+                        &config.theme,
                         &mut draft.shortcut_input,
                         &mut draft.shortcut,
                         &mut draft.recording_shortcut,
@@ -544,10 +545,18 @@ fn render_sound_editor_modal(
     }
 }
 
+fn blend_rgb(a: [u8; 3], b: [u8; 3], t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| -> u8 { ((x as f32) * (1.0 - t) + (y as f32) * t).round() as u8 };
+    Color32::from_rgb(mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2]))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_shortcut_picker(
     ctx: &egui::Context,
     ui: &mut egui::Ui,
     id: egui::Id,
+    theme: &ThemeConfig,
     shortcut_input: &mut String,
     shortcut_value: &mut Option<String>,
     recording: &mut bool,
@@ -571,6 +580,13 @@ fn render_shortcut_picker(
         }
     }
 
+    let text_color = rgb_to_color32(theme.pad_text);
+    let muted_hint = text_color.gamma_multiply(0.45);
+    let accent = rgb_to_color32(theme.accent_color);
+    let border_muted = rgb_to_color32(theme.toolbar_divider);
+    let is_bound = shortcut_value.is_some() && !shortcut_input.trim().is_empty();
+    let has_text = !shortcut_input.trim().is_empty() || shortcut_value.is_some();
+
     ui.horizontal(|ui| {
         if *recording {
             let coral = Color32::from_rgb(235, 110, 60);
@@ -579,12 +595,36 @@ fn render_shortcut_picker(
                 *recording = false;
             }
         } else {
-            let resp = ui.add(
-                egui::TextEdit::singleline(shortcut_input)
-                    .id(id)
-                    .desired_width(136.0)
-                    .hint_text("Ctrl+1 / F13 / Numpad1"),
-            );
+            let field_bg = if is_bound {
+                blend_rgb(theme.bg_main, theme.accent_color, 0.14)
+            } else {
+                rgb_to_color32(theme.bg_main)
+            };
+            let field_stroke = if is_bound {
+                Stroke::new(
+                    1.25_f32,
+                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 195),
+                )
+            } else {
+                Stroke::new(1.0_f32, border_muted)
+            };
+
+            let resp = ui
+                .scope(|ui| {
+                    ui.visuals_mut().widgets.inactive.bg_stroke = field_stroke;
+                    ui.visuals_mut().widgets.hovered.bg_stroke = Stroke::new(1.25_f32, accent);
+                    ui.add(
+                        egui::TextEdit::singleline(shortcut_input)
+                            .id(id)
+                            .desired_width(146.0)
+                            .background_color(field_bg)
+                            .text_color(text_color)
+                            .hint_text(
+                                egui::RichText::new("None (e.g. Ctrl+F1)").color(muted_hint),
+                            ),
+                    )
+                })
+                .inner;
             if resp.changed() {
                 let trimmed = shortcut_input.trim();
                 if trimmed.is_empty() {
@@ -610,9 +650,8 @@ fn render_shortcut_picker(
                     ctx.memory_mut(|m| m.surrender_focus(focused));
                 }
             }
-            let has_shortcut = !shortcut_input.trim().is_empty() || shortcut_value.is_some();
             if ui
-                .add_enabled(has_shortcut, egui::Button::new("X"))
+                .add_visible(has_text, egui::Button::new("X"))
                 .on_hover_text("Clear shortcut")
                 .clicked()
             {
@@ -892,6 +931,7 @@ fn render_settings_modal(
                                 ctx,
                                 ui,
                                 egui::Id::new(("settings_shortcut_picker", tag)),
+                                &config.theme,
                                 &mut input_buf,
                                 &mut next_val,
                                 &mut recording,
