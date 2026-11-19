@@ -12,6 +12,9 @@ use crate::config::AppConfig;
 pub enum HotkeyAction {
     PlaySound(String),
     StopAll,
+    PitchUp,
+    PitchDown,
+    PitchReset,
 }
 
 /// Result of inspecting `egui` key events while recording a new shortcut.
@@ -66,6 +69,9 @@ pub struct HotkeyService {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BindingsSignature {
     stop_shortcut: Option<String>,
+    pitch_up_shortcut: Option<String>,
+    pitch_down_shortcut: Option<String>,
+    pitch_reset_shortcut: Option<String>,
     sound_shortcuts: Vec<(String, String, Option<String>)>,
 }
 
@@ -113,10 +119,13 @@ impl HotkeyService {
         self.last_signature = None;
     }
 
-    /// Re-registers global hotkeys whenever sound or stop-all shortcuts change in [`AppConfig`].
+    /// Re-registers global hotkeys whenever sound or global shortcuts change in [`AppConfig`].
     pub fn sync_bindings(&mut self, config: &AppConfig) {
         let sig = BindingsSignature {
             stop_shortcut: config.stop_shortcut.clone(),
+            pitch_up_shortcut: config.pitch_up_shortcut.clone(),
+            pitch_down_shortcut: config.pitch_down_shortcut.clone(),
+            pitch_reset_shortcut: config.pitch_reset_shortcut.clone(),
             sound_shortcuts: config
                 .sounds
                 .iter()
@@ -143,52 +152,47 @@ impl HotkeyService {
         self.status.macos_accessibility_trusted = query_macos_accessibility_trusted();
         let mut has_any_shortcut = false;
 
-        if let Some(ref stop_raw) = config.stop_shortcut {
-            has_any_shortcut = true;
-            match parse_shortcut(stop_raw) {
-                Ok(hotkey) => match manager.register(hotkey) {
-                    Ok(()) => {
-                        self.id_to_action.insert(hotkey.id(), HotkeyAction::StopAll);
-                        self.registered_hotkeys.push(hotkey);
-                    }
-                    Err(err) => warnings.push(format!(
-                        "Could not register Stop All shortcut '{stop_raw}' (already in use or blocked by OS): {err}"
-                    )),
-                },
-                Err(err) => warnings.push(format!("Invalid Stop All shortcut '{stop_raw}': {err}")),
-            }
-        }
-
-        for sound in &config.sounds {
-            let Some(ref raw) = sound.shortcut else {
-                continue;
-            };
+        let mut register_binding = |raw: &str, owner_label: &str, action: HotkeyAction| {
             has_any_shortcut = true;
             match parse_shortcut(raw) {
                 Ok(hotkey) => {
                     if self.id_to_action.contains_key(&hotkey.id()) {
                         warnings.push(format!(
-                            "Skipped duplicate shortcut '{raw}' on '{}'.",
-                            sound.title
+                            "Skipped duplicate shortcut '{raw}' on {owner_label}."
                         ));
-                        continue;
+                        return;
                     }
                     match manager.register(hotkey) {
                         Ok(()) => {
-                            self.id_to_action
-                                .insert(hotkey.id(), HotkeyAction::PlaySound(sound.id.clone()));
+                            self.id_to_action.insert(hotkey.id(), action);
                             self.registered_hotkeys.push(hotkey);
                         }
                         Err(err) => warnings.push(format!(
-                            "Could not register shortcut '{raw}' for '{}' (already in use or blocked by OS): {err}",
-                            sound.title
+                            "Could not register {owner_label} shortcut '{raw}' (already in use or blocked by OS): {err}"
                         )),
                     }
                 }
-                Err(err) => warnings.push(format!(
-                    "Invalid shortcut '{raw}' on '{}': {err}",
-                    sound.title
-                )),
+                Err(err) => {
+                    warnings.push(format!("Invalid {owner_label} shortcut '{raw}': {err}"))
+                }
+            }
+        };
+
+        for (slot, label, action) in [
+            (&config.stop_shortcut, "Stop All", HotkeyAction::StopAll),
+            (&config.pitch_up_shortcut, "Pitch Up", HotkeyAction::PitchUp),
+            (&config.pitch_down_shortcut, "Pitch Down", HotkeyAction::PitchDown),
+            (&config.pitch_reset_shortcut, "Pitch Reset", HotkeyAction::PitchReset),
+        ] {
+            if let Some(raw) = slot {
+                register_binding(raw, label, action);
+            }
+        }
+
+        for sound in &config.sounds {
+            if let Some(ref raw) = sound.shortcut {
+                let owner = format!("'{}'", sound.title);
+                register_binding(raw, &owner, HotkeyAction::PlaySound(sound.id.clone()));
             }
         }
 
@@ -587,7 +591,7 @@ fn egui_key_to_code(key: egui::Key) -> Option<Code> {
         K::ArrowLeft => Code::ArrowLeft,
         K::ArrowRight => Code::ArrowRight,
         K::Minus => Code::Minus,
-        K::Equals => Code::Equal,
+        K::Equals | K::Plus => Code::Equal,
         K::Backtick => Code::Backquote,
         K::OpenBracket => Code::BracketLeft,
         K::CloseBracket => Code::BracketRight,

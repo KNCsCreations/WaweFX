@@ -891,16 +891,16 @@ const MOBILE_WEB_HTML: &str = r##"<!DOCTYPE html>
 <title>WaweFX Remote</title>
 <style>
   :root {
-    --bg-main: #F4EFE6;
-    --bg-toolbar: #EAE2D3;
-    --toolbar-divider: #CFC3B0;
-    --icon-primary: #2B2520;
-    --icon-secondary: #7A6F64;
-    --gauge-track: #7A6F64;
-    --accent: #B08968;
-    --pad-bg: #EAE2D3;
-    --pad-hover: #DFD5C3;
-    --pad-text: #2B2520;
+    --bg-main: #181B22;
+    --bg-toolbar: #20242E;
+    --toolbar-divider: #0F1117;
+    --icon-primary: #CBD5E1;
+    --icon-secondary: #94A3B8;
+    --gauge-track: #64748B;
+    --accent: #38BDF8;
+    --pad-bg: #242936;
+    --pad-hover: #2E3445;
+    --pad-text: #F1F5F9;
   }
   * {
     box-sizing: border-box;
@@ -1972,9 +1972,23 @@ mod tests {
         });
         let list_json = serde_json::to_string(&list_ev).unwrap();
         assert!(list_json.contains(r#""type":"SoundsListUpdated""#));
-        assert!(list_json.contains(r##""bg_main":"#F4EFE6""##));
-        assert!(list_json.contains(r##""pad_card_bg":"#EAE2D3""##));
-        assert!(list_json.contains(r##""accent_color":"#B08968""##));
+        assert!(list_json.contains(r##""bg_main":"#181B22""##));
+        assert!(list_json.contains(r##""pad_card_bg":"#242936""##));
+        assert!(list_json.contains(r##""accent_color":"#38BDF8""##));
+
+        let custom_named = crate::config::NamedTheme {
+            name: "Amber".to_string(),
+            theme: ThemeConfig {
+                bg_main: [0x12, 0x34, 0x56],
+                accent_color: [0xFE, 0xDC, 0xBA],
+                ..ThemeConfig::midnight_dark()
+            },
+        };
+        let mut custom_theme = ThemeConfig::default();
+        custom_theme.apply_named_preset(&custom_named);
+        let custom_dto = SyncThemeDto::from_theme(&custom_theme);
+        assert_eq!(custom_dto.bg_main, "#123456");
+        assert_eq!(custom_dto.accent_color, "#FEDCBA");
 
         let tick_ev = SyncEvent::PlaybackTick(PlaybackTickPayload {
             active_sound_id: Some("1".to_string()),

@@ -28,6 +28,18 @@ pub const TARGET_CHANNELS: u16 = 2;
 pub const MIN_PLAYBACK_SPEED: f32 = 0.5;
 pub const MAX_PLAYBACK_SPEED: f32 = 2.0;
 
+/// Minimum, maximum, and default playback pitch hotkey step size.
+pub const MIN_PITCH_STEP: f32 = 0.01;
+pub const MAX_PITCH_STEP: f32 = 0.50;
+pub const DEFAULT_PITCH_STEP: f32 = 0.05;
+
+/// Steps playback speed by `delta`, clamped to `[MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED]`
+/// and rounded to 4 decimal places to avoid floating-point drift across repeated presses.
+pub fn step_playback_speed(current: f32, delta: f32) -> f32 {
+    let next = (current + delta).clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED);
+    (next * 10_000.0).round() / 10_000.0
+}
+
 /// Minimum and maximum supported stream volume gain (0% to 200%).
 pub const MIN_STREAM_VOLUME: f32 = 0.0;
 pub const MAX_STREAM_VOLUME: f32 = 2.0;
@@ -112,6 +124,7 @@ pub struct AudioRoutingConfig {
     pub headphones_stream_enabled: bool,
     pub headphones_volume: f32,
     pub playback_speed: f32,
+    pub pitch_step: f32,
     pub sync_port: u16,
 }
 
@@ -127,16 +140,17 @@ impl Default for AudioRoutingConfig {
             headphones_stream_enabled: true,
             headphones_volume: 1.0,
             playback_speed: 1.0,
+            pitch_step: DEFAULT_PITCH_STEP,
             sync_port: 8765,
         }
     }
 }
 
-/// Available color theme presets in Settings, plus `Custom` when RGB values are edited manually.
+/// Available color theme presets in Settings, plus `Custom` when RGB values or a user preset are active.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ThemePreset {
-    #[default]
     WarmBeige,
+    #[default]
     MidnightDark,
     NordFrost,
     Custom,
@@ -145,8 +159,8 @@ pub enum ThemePreset {
 impl ThemePreset {
     /// The 3 built-in presets displayed in the Settings theme selector.
     pub const BUILTIN_PRESETS: [ThemePreset; 3] = [
-        ThemePreset::WarmBeige,
         ThemePreset::MidnightDark,
+        ThemePreset::WarmBeige,
         ThemePreset::NordFrost,
     ];
 
@@ -161,11 +175,29 @@ impl ThemePreset {
     }
 }
 
+/// User-saved named color palette stored in `wawefx_config.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NamedTheme {
+    pub name: String,
+    pub theme: ThemeConfig,
+}
+
+impl Default for NamedTheme {
+    fn default() -> Self {
+        Self {
+            name: "Custom Preset".to_string(),
+            theme: ThemeConfig::midnight_dark(),
+        }
+    }
+}
+
 /// Full customizable color palette for the WaweFX toolbar, canvas, and soundboard grid.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ThemeConfig {
     pub preset: ThemePreset,
+    pub active_user_preset: Option<String>,
     pub bg_main: [u8; 3],
     pub bg_toolbar: [u8; 3],
     pub toolbar_divider: [u8; 3],
@@ -182,7 +214,7 @@ pub struct ThemeConfig {
 
 impl Default for ThemeConfig {
     fn default() -> Self {
-        Self::warm_beige()
+        Self::midnight_dark()
     }
 }
 
@@ -191,6 +223,7 @@ impl ThemeConfig {
     pub fn warm_beige() -> Self {
         Self {
             preset: ThemePreset::WarmBeige,
+            active_user_preset: None,
             bg_main: [0xF4, 0xEF, 0xE6],
             bg_toolbar: [0xEA, 0xE2, 0xD3],
             toolbar_divider: [0xCF, 0xC3, 0xB0],
@@ -210,6 +243,7 @@ impl ThemeConfig {
     pub fn midnight_dark() -> Self {
         Self {
             preset: ThemePreset::MidnightDark,
+            active_user_preset: None,
             bg_main: [0x18, 0x1B, 0x22],
             bg_toolbar: [0x20, 0x24, 0x2E],
             toolbar_divider: [0x0F, 0x11, 0x17],
@@ -229,6 +263,7 @@ impl ThemeConfig {
     pub fn nord_frost() -> Self {
         Self {
             preset: ThemePreset::NordFrost,
+            active_user_preset: None,
             bg_main: [0x2E, 0x34, 0x40],
             bg_toolbar: [0x3B, 0x42, 0x52],
             toolbar_divider: [0x24, 0x29, 0x33],
@@ -251,8 +286,9 @@ impl ThemeConfig {
             ThemePreset::MidnightDark => Self::midnight_dark(),
             ThemePreset::NordFrost => Self::nord_frost(),
             ThemePreset::Custom => {
-                let mut custom = Self::warm_beige();
+                let mut custom = Self::midnight_dark();
                 custom.preset = ThemePreset::Custom;
+                custom.active_user_preset = None;
                 custom
             }
         }
@@ -262,20 +298,47 @@ impl ThemeConfig {
     pub fn apply_preset(&mut self, preset: ThemePreset) {
         if preset == ThemePreset::Custom {
             self.preset = ThemePreset::Custom;
+            self.active_user_preset = None;
             return;
         }
         *self = Self::from_preset(preset);
     }
 
+    /// Applies a saved user preset palette and marks it as the active named preset.
+    pub fn apply_named_preset(&mut self, named: &NamedTheme) {
+        let mut next = named.theme.clone();
+        next.preset = ThemePreset::Custom;
+        next.active_user_preset = Some(named.name.clone());
+        *self = next;
+    }
+
     /// Switches `preset` to [`ThemePreset::Custom`] if the current colors no longer match the active preset.
     pub fn mark_custom_if_changed(&mut self) {
         if self.preset == ThemePreset::Custom {
+            self.active_user_preset = None;
             return;
         }
         let baseline = Self::from_preset(self.preset);
         if !self.colors_equal(&baseline) {
             self.preset = ThemePreset::Custom;
+            self.active_user_preset = None;
         }
+    }
+
+    /// Tracks whether edited RGB colors still match either an active user preset or built-in preset.
+    pub fn mark_custom_if_changed_with_presets(&mut self, user_presets: &[NamedTheme]) {
+        if let Some(ref active_name) = self.active_user_preset {
+            let matches_user = user_presets
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(active_name))
+                .is_some_and(|p| self.colors_equal(&p.theme));
+            if !matches_user {
+                self.active_user_preset = None;
+                self.preset = ThemePreset::Custom;
+            }
+            return;
+        }
+        self.mark_custom_if_changed();
     }
 
     fn colors_equal(&self, other: &Self) -> bool {
@@ -299,6 +362,16 @@ pub fn rgb_to_color32(rgb: [u8; 3]) -> Color32 {
     Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
 
+/// Identifies which sound pad or global action owns a shortcut binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutOwner<'a> {
+    Sound(&'a str),
+    StopAll,
+    PitchUp,
+    PitchDown,
+    PitchReset,
+}
+
 /// Root persistent application configuration serialized to `wawefx_config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -306,8 +379,12 @@ pub struct AppConfig {
     pub sounds: Vec<SoundItem>,
     pub selected_sound_id: Option<String>,
     pub stop_shortcut: Option<String>,
+    pub pitch_up_shortcut: Option<String>,
+    pub pitch_down_shortcut: Option<String>,
+    pub pitch_reset_shortcut: Option<String>,
     pub audio: AudioRoutingConfig,
     pub theme: ThemeConfig,
+    pub user_presets: Vec<NamedTheme>,
 }
 
 impl AppConfig {
@@ -617,6 +694,53 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Saves the current theme colors as a named user preset in `user_presets`
+    /// (updating an existing preset on case-insensitive name match).
+    pub fn save_user_preset(&mut self, raw_name: &str) -> bool {
+        let name = raw_name.trim().to_string();
+        if name.is_empty() {
+            return false;
+        }
+        let mut palette = self.theme.clone();
+        palette.preset = ThemePreset::Custom;
+        palette.active_user_preset = Some(name.clone());
+
+        if let Some(existing) = self
+            .user_presets
+            .iter_mut()
+            .find(|p| p.name.eq_ignore_ascii_case(&name))
+        {
+            existing.name = name.clone();
+            existing.theme = palette;
+        } else {
+            self.user_presets.push(NamedTheme {
+                name: name.clone(),
+                theme: palette,
+            });
+        }
+        self.theme.preset = ThemePreset::Custom;
+        self.theme.active_user_preset = Some(name);
+        true
+    }
+
+    /// Deletes a saved user preset by index and clears `active_user_preset` if it was selected.
+    pub fn delete_user_preset(&mut self, index: usize) -> bool {
+        if index >= self.user_presets.len() {
+            return false;
+        }
+        let removed = self.user_presets.remove(index);
+        if self
+            .theme
+            .active_user_preset
+            .as_deref()
+            .is_some_and(|active| active.eq_ignore_ascii_case(&removed.name))
+        {
+            self.theme.active_user_preset = None;
+            self.theme.preset = ThemePreset::Custom;
+        }
+        true
+    }
+
     /// Clamps numeric fields to safe runtime bounds and normalizes selection.
     pub fn sanitize(&mut self) {
         self.audio.mic_volume = self.audio.mic_volume.clamp(MIN_STREAM_VOLUME, MAX_STREAM_VOLUME);
@@ -628,6 +752,10 @@ impl AppConfig {
             .audio
             .playback_speed
             .clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED);
+        if !self.audio.pitch_step.is_finite() {
+            self.audio.pitch_step = DEFAULT_PITCH_STEP;
+        }
+        self.audio.pitch_step = self.audio.pitch_step.clamp(MIN_PITCH_STEP, MAX_PITCH_STEP);
         if self.audio.sync_port == 0 {
             self.audio.sync_port = 8765;
         }
@@ -640,80 +768,133 @@ impl AppConfig {
         {
             self.selected_sound_id = self.sounds.first().map(|s| s.id.clone());
         }
-        self.stop_shortcut = self
-            .stop_shortcut
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        for slot in [
+            &mut self.stop_shortcut,
+            &mut self.pitch_up_shortcut,
+            &mut self.pitch_down_shortcut,
+            &mut self.pitch_reset_shortcut,
+        ] {
+            normalize_optional_shortcut(slot);
+        }
         for sound in &mut self.sounds {
-            sound.shortcut = sound
-                .shortcut
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            normalize_optional_shortcut(&mut sound.shortcut);
+        }
+
+        let mut cleaned_presets: Vec<NamedTheme> = Vec::with_capacity(self.user_presets.len());
+        for mut preset in std::mem::take(&mut self.user_presets) {
+            let trimmed = preset.name.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+            preset.name = trimmed.clone();
+            preset.theme.preset = ThemePreset::Custom;
+            preset.theme.active_user_preset = Some(trimmed.clone());
+            if let Some(existing) = cleaned_presets
+                .iter_mut()
+                .find(|p| p.name.eq_ignore_ascii_case(&trimmed))
+            {
+                *existing = preset;
+            } else {
+                cleaned_presets.push(preset);
+            }
+        }
+        self.user_presets = cleaned_presets;
+        if let Some(ref active) = self.theme.active_user_preset
+            && !self
+                .user_presets
+                .iter()
+                .any(|p| p.name.eq_ignore_ascii_case(active))
+        {
+            self.theme.active_user_preset = None;
         }
     }
 
-    /// Returns a human-readable label of any conflicting sound or Stop-All binding for `shortcut`.
+    /// Returns a human-readable label of any conflicting sound or global shortcut owner for `shortcut`.
     pub fn shortcut_conflict_label(
         &self,
         shortcut: &str,
-        ignore_sound_id: Option<&str>,
-        check_stop: bool,
+        ignore: Option<ShortcutOwner<'_>>,
     ) -> Option<String> {
         let target = crate::hotkeys::canonical_shortcut_key(shortcut)?;
         for sound in &self.sounds {
-            if ignore_sound_id == Some(sound.id.as_str()) {
+            if ignore == Some(ShortcutOwner::Sound(sound.id.as_str())) {
                 continue;
             }
             if let Some(ref existing) = sound.shortcut
-                && crate::hotkeys::canonical_shortcut_key(existing).as_deref() == Some(target.as_str())
+                && crate::hotkeys::canonical_shortcut_key(existing).as_deref()
+                    == Some(target.as_str())
             {
                 return Some(format!("Sound '{}'", sound.title));
             }
         }
-        if check_stop
-            && let Some(ref stop_sc) = self.stop_shortcut
-            && crate::hotkeys::canonical_shortcut_key(stop_sc).as_deref() == Some(target.as_str())
-        {
-            return Some("Global Stop All Sounds".to_string());
+        for (slot, owner, label) in [
+            (&self.stop_shortcut, ShortcutOwner::StopAll, "Global Stop All Sounds"),
+            (&self.pitch_up_shortcut, ShortcutOwner::PitchUp, "Global Pitch Up"),
+            (&self.pitch_down_shortcut, ShortcutOwner::PitchDown, "Global Pitch Down"),
+            (&self.pitch_reset_shortcut, ShortcutOwner::PitchReset, "Global Pitch Reset"),
+        ] {
+            if ignore == Some(owner) {
+                continue;
+            }
+            if let Some(ref existing) = *slot
+                && crate::hotkeys::canonical_shortcut_key(existing).as_deref()
+                    == Some(target.as_str())
+            {
+                return Some(label.to_string());
+            }
         }
         None
     }
 
-    /// Unbinds `shortcut` from any other sound pad (or `stop_shortcut` when `keep_stop` is false).
+    /// Unbinds `shortcut` from any other sound pad or global action (except `keep`).
     pub fn unbind_shortcut_conflicts(
         &mut self,
         shortcut: &str,
-        keep_sound_id: Option<&str>,
-        keep_stop: bool,
+        keep: Option<ShortcutOwner<'_>>,
     ) -> Vec<String> {
         let Some(target) = crate::hotkeys::canonical_shortcut_key(shortcut) else {
             return Vec::new();
         };
         let mut unbound = Vec::new();
         for sound in &mut self.sounds {
-            if keep_sound_id == Some(sound.id.as_str()) {
+            if keep == Some(ShortcutOwner::Sound(sound.id.as_str())) {
                 continue;
             }
             if let Some(ref existing) = sound.shortcut
-                && crate::hotkeys::canonical_shortcut_key(existing).as_deref() == Some(target.as_str())
+                && crate::hotkeys::canonical_shortcut_key(existing).as_deref()
+                    == Some(target.as_str())
             {
                 unbound.push(sound.title.clone());
                 sound.shortcut = None;
             }
         }
-        if !keep_stop
-            && let Some(ref stop_sc) = self.stop_shortcut
-            && crate::hotkeys::canonical_shortcut_key(stop_sc).as_deref() == Some(target.as_str())
-        {
-            unbound.push("Global Stop All Sounds".to_string());
-            self.stop_shortcut = None;
+        for (slot, owner, label) in [
+            (&mut self.stop_shortcut, ShortcutOwner::StopAll, "Global Stop All Sounds"),
+            (&mut self.pitch_up_shortcut, ShortcutOwner::PitchUp, "Global Pitch Up"),
+            (&mut self.pitch_down_shortcut, ShortcutOwner::PitchDown, "Global Pitch Down"),
+            (&mut self.pitch_reset_shortcut, ShortcutOwner::PitchReset, "Global Pitch Reset"),
+        ] {
+            if keep == Some(owner) {
+                continue;
+            }
+            if let Some(ref existing) = *slot
+                && crate::hotkeys::canonical_shortcut_key(existing).as_deref()
+                    == Some(target.as_str())
+            {
+                unbound.push(label.to_string());
+                *slot = None;
+            }
         }
         unbound
     }
+}
+
+fn normalize_optional_shortcut(slot: &mut Option<String>) {
+    *slot = slot
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 }
 
 #[cfg(test)]
@@ -721,31 +902,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_theme_is_warm_beige() {
+    fn default_theme_is_midnight_dark() {
         let theme = ThemeConfig::default();
-        assert_eq!(theme.preset, ThemePreset::WarmBeige);
-        assert_eq!(theme.bg_main, [0xF4, 0xEF, 0xE6]);
-        assert_eq!(theme.bg_toolbar, [0xEA, 0xE2, 0xD3]);
-        assert_eq!(theme.pad_card_bg, [0xEA, 0xE2, 0xD3]);
-        assert_eq!(theme.toolbar_divider, [0xCF, 0xC3, 0xB0]);
-        assert_eq!(theme.icon_primary, [0x2B, 0x25, 0x20]);
-        assert_eq!(theme.pad_text, [0x2B, 0x25, 0x20]);
-        assert_eq!(theme.gauge_and_track, [0x7A, 0x6F, 0x64]);
-        assert_eq!(theme.accent_color, [0xB0, 0x89, 0x68]);
+        assert_eq!(theme.preset, ThemePreset::MidnightDark);
+        assert_eq!(theme.active_user_preset, None);
+        assert_eq!(theme.bg_main, [0x18, 0x1B, 0x22]);
+        assert_eq!(theme.bg_toolbar, [0x20, 0x24, 0x2E]);
+        assert_eq!(theme.pad_card_bg, [0x24, 0x29, 0x36]);
+        assert_eq!(theme.toolbar_divider, [0x0F, 0x11, 0x17]);
+        assert_eq!(theme.icon_primary, [0xCB, 0xD5, 0xE1]);
+        assert_eq!(theme.pad_text, [0xF1, 0xF5, 0xF9]);
+        assert_eq!(theme.gauge_and_track, [0x64, 0x74, 0x8B]);
+        assert_eq!(theme.accent_color, [0x38, 0xBD, 0xF8]);
         assert_eq!(
             rgb_to_color32(theme.accent_color),
-            Color32::from_rgb(0xB0, 0x89, 0x68)
+            Color32::from_rgb(0x38, 0xBD, 0xF8)
         );
+
+        let beige = ThemeConfig::warm_beige();
+        assert_eq!(beige.preset, ThemePreset::WarmBeige);
+        assert_eq!(beige.bg_main, [0xF4, 0xEF, 0xE6]);
     }
 
     #[test]
     fn builtin_presets_switch_and_track_custom_edits() {
         assert_eq!(ThemePreset::BUILTIN_PRESETS.len(), 3);
+        assert_eq!(ThemePreset::BUILTIN_PRESETS[0], ThemePreset::MidnightDark);
 
         let mut theme = ThemeConfig::default();
-        theme.apply_preset(ThemePreset::MidnightDark);
-        assert_eq!(theme.preset, ThemePreset::MidnightDark);
-        assert_eq!(theme.bg_main, [0x18, 0x1B, 0x22]);
+        theme.apply_preset(ThemePreset::WarmBeige);
+        assert_eq!(theme.preset, ThemePreset::WarmBeige);
+        assert_eq!(theme.bg_main, [0xF4, 0xEF, 0xE6]);
 
         theme.apply_preset(ThemePreset::NordFrost);
         assert_eq!(theme.preset, ThemePreset::NordFrost);
@@ -816,8 +1003,14 @@ mod tests {
                 }
             ]
         }"#;
-        let parsed: AppConfig = serde_json::from_str(legacy_json).expect("legacy json parses");
+        let mut parsed: AppConfig = serde_json::from_str(legacy_json).expect("legacy json parses");
+        parsed.sanitize();
         assert_eq!(parsed.stop_shortcut, None);
+        assert_eq!(parsed.pitch_up_shortcut, None);
+        assert_eq!(parsed.pitch_down_shortcut, None);
+        assert_eq!(parsed.pitch_reset_shortcut, None);
+        assert!(parsed.user_presets.is_empty());
+        assert!((parsed.audio.pitch_step - DEFAULT_PITCH_STEP).abs() < 1e-6);
         assert_eq!(parsed.sounds[0].shortcut, None);
 
         let mut cfg = AppConfig::default();
@@ -828,14 +1021,88 @@ mod tests {
         cfg.sounds.push(s1);
         cfg.sounds.push(s2);
         cfg.stop_shortcut = Some("F9".to_string());
+        cfg.pitch_up_shortcut = Some("F10".to_string());
+        cfg.pitch_down_shortcut = Some("F11".to_string());
+        cfg.pitch_reset_shortcut = Some("F12".to_string());
 
-        let unbound = cfg.unbind_shortcut_conflicts("ctrl+shift+1", Some(&s2_id), false);
+        let unbound =
+            cfg.unbind_shortcut_conflicts("ctrl+shift+1", Some(ShortcutOwner::Sound(&s2_id)));
         assert_eq!(unbound, vec!["Horn".to_string()]);
         assert_eq!(cfg.sounds[0].shortcut, None);
 
-        let unbound_stop = cfg.unbind_shortcut_conflicts("f9", Some(&s2_id), false);
+        let unbound_stop = cfg.unbind_shortcut_conflicts("f9", Some(ShortcutOwner::Sound(&s2_id)));
         assert_eq!(unbound_stop, vec!["Global Stop All Sounds".to_string()]);
         assert_eq!(cfg.stop_shortcut, None);
+
+        let unbound_pitch = cfg.unbind_shortcut_conflicts("f10", Some(ShortcutOwner::PitchReset));
+        assert_eq!(unbound_pitch, vec!["Global Pitch Up".to_string()]);
+        assert_eq!(cfg.pitch_up_shortcut, None);
+    }
+
+    #[test]
+    fn user_presets_save_apply_overwrite_delete_and_roundtrip() {
+        let mut cfg = AppConfig::default();
+        cfg.theme.apply_preset(ThemePreset::WarmBeige);
+        cfg.theme.accent_color = [0xAA, 0x22, 0x66];
+        cfg.theme.mark_custom_if_changed_with_presets(&cfg.user_presets);
+        assert_eq!(cfg.theme.preset, ThemePreset::Custom);
+
+        assert!(!cfg.save_user_preset("   "));
+        assert!(cfg.save_user_preset("Crimson Lounge"));
+        assert_eq!(cfg.user_presets.len(), 1);
+        assert_eq!(
+            cfg.theme.active_user_preset.as_deref(),
+            Some("Crimson Lounge")
+        );
+
+        // Editing a color while a named user preset is active transitions back to generic Custom
+        cfg.theme.bg_main = [0x10, 0x10, 0x10];
+        cfg.theme.mark_custom_if_changed_with_presets(&cfg.user_presets);
+        assert_eq!(cfg.theme.active_user_preset, None);
+        assert_eq!(cfg.theme.preset, ThemePreset::Custom);
+
+        // Case-insensitive overwrite keeps single entry
+        assert!(cfg.save_user_preset("crimson lounge"));
+        assert_eq!(cfg.user_presets.len(), 1);
+        assert_eq!(cfg.user_presets[0].theme.bg_main, [0x10, 0x10, 0x10]);
+
+        // Switch away and apply saved user preset back
+        cfg.theme.apply_preset(ThemePreset::MidnightDark);
+        assert_eq!(cfg.theme.active_user_preset, None);
+        cfg.theme.apply_named_preset(&cfg.user_presets[0]);
+        assert_eq!(cfg.theme.bg_main, [0x10, 0x10, 0x10]);
+        assert_eq!(
+            cfg.theme.active_user_preset.as_deref(),
+            Some("crimson lounge")
+        );
+
+        let temp_path =
+            std::env::temp_dir().join(format!("wawefx_presets_{}.json", Uuid::new_v4()));
+        cfg.save_to_path(&temp_path).expect("save config with user preset");
+        let mut loaded = AppConfig::load_from_path(&temp_path).expect("load config with user preset");
+        let _ = fs::remove_file(&temp_path);
+
+        assert_eq!(loaded.user_presets.len(), 1);
+        assert!(loaded.delete_user_preset(0));
+        assert!(loaded.user_presets.is_empty());
+        assert_eq!(loaded.theme.active_user_preset, None);
+    }
+
+    #[test]
+    fn step_playback_speed_clamps_and_avoids_float_drift() {
+        let mut speed = 1.0f32;
+        for _ in 0..3 {
+            speed = step_playback_speed(speed, 0.05);
+        }
+        assert!((speed - 1.15).abs() < 1e-6);
+
+        for _ in 0..3 {
+            speed = step_playback_speed(speed, -0.05);
+        }
+        assert_eq!(speed, 1.0);
+
+        assert_eq!(step_playback_speed(1.9, 0.5), MAX_PLAYBACK_SPEED);
+        assert_eq!(step_playback_speed(0.6, -0.5), MIN_PLAYBACK_SPEED);
     }
 
     #[test]

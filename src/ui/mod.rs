@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use image::ImageReader;
@@ -19,7 +19,7 @@ use uuid::Uuid;
 pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../assets/logo.png");
 
 use crate::audio::{AudioDeviceList, AudioEngine};
-use crate::config::{AppConfig, SoundItem, rgb_to_color32};
+use crate::config::{AppConfig, ShortcutOwner, SoundItem, rgb_to_color32, step_playback_speed};
 use crate::hotkeys::{HotkeyAction, HotkeyService};
 use crate::sync::{DesktopSyncNotice, SyncServerHandle};
 use crate::ui::modals::{ActiveModal, DriverSetupState, SoundModalDraft};
@@ -128,6 +128,24 @@ impl ThumbnailLoader {
         self.pending.retain(|(id, _)| id != sound_id);
         self.failed.retain(|(id, _)| id != sound_id);
     }
+
+    /// Uploads a freshly decoded image immediately as a GPU texture for zero-lag cover updates.
+    pub fn set_decoded(
+        &mut self,
+        ctx: &egui::Context,
+        sound_id: &str,
+        path: PathBuf,
+        image: ColorImage,
+    ) {
+        self.pending.retain(|(id, _)| id != sound_id);
+        self.failed.retain(|(id, _)| id != sound_id);
+        let handle = ctx.load_texture(
+            format!("pad_thumb_{sound_id}"),
+            image,
+            TextureOptions::LINEAR,
+        );
+        self.textures.insert(sound_id.to_string(), (path, handle));
+    }
 }
 
 impl Default for ThumbnailLoader {
@@ -181,6 +199,8 @@ pub struct WaweFxApp {
     pub updater: UpdateChecker,
     pub local_ip: String,
     pub last_error: Option<String>,
+    last_hovered_image_pad_id: Option<String>,
+    status_toast: Option<(String, Instant)>,
     last_playback_state: (bool, Option<String>),
 }
 
@@ -210,8 +230,19 @@ impl WaweFxApp {
             updater,
             local_ip,
             last_error: None,
+            last_hovered_image_pad_id: None,
+            status_toast: None,
             last_playback_state,
         }
+    }
+
+    fn set_target_pitch(&mut self, next_speed: f32) {
+        let clamped = next_speed.clamp(
+            crate::config::MIN_PLAYBACK_SPEED,
+            crate::config::MAX_PLAYBACK_SPEED,
+        );
+        self.config.audio.playback_speed = clamped;
+        self.audio.set_speed(clamped);
     }
 
     fn play_sound_by_id(&mut self, sound_id: &str) {
@@ -293,7 +324,7 @@ impl WaweFxApp {
         if let Some(edit_id) = draft.editing_id {
             if let Some(ref sc) = normalized_shortcut {
                 self.config
-                    .unbind_shortcut_conflicts(sc, Some(&edit_id), false);
+                    .unbind_shortcut_conflicts(sc, Some(ShortcutOwner::Sound(&edit_id)));
             }
             let mut old_paths: Option<(PathBuf, Option<PathBuf>)> = None;
             if let Some(existing) = self.config.sounds.iter_mut().find(|s| s.id == edit_id) {
@@ -327,7 +358,7 @@ impl WaweFxApp {
             let new_id = Uuid::new_v4().to_string();
             if let Some(ref sc) = normalized_shortcut {
                 self.config
-                    .unbind_shortcut_conflicts(sc, Some(&new_id), false);
+                    .unbind_shortcut_conflicts(sc, Some(ShortcutOwner::Sound(&new_id)));
             }
             let new_item = SoundItem {
                 id: new_id.clone(),
@@ -350,6 +381,11 @@ impl eframe::App for WaweFxApp {
         self.sync.register_egui_ctx(ctx.clone());
         self.thumbnails.poll(ctx);
 
+        let (hovered_files, dropped_files) =
+            ctx.input(|i| (i.raw.hovered_files.clone(), i.raw.dropped_files.clone()));
+        let active_file_drag = !hovered_files.is_empty() || !dropped_files.is_empty();
+        let drop_pointer_pos = resolve_file_drop_pointer_pos(ctx, active_file_drag);
+
         let mut config_dirty = false;
         let mut sync_dirty = false;
 
@@ -364,6 +400,32 @@ impl eframe::App for WaweFxApp {
                 }
                 HotkeyAction::StopAll => {
                     self.audio.stop();
+                    sync_dirty = true;
+                    ctx.request_repaint();
+                }
+                HotkeyAction::PitchUp => {
+                    let next = step_playback_speed(
+                        self.config.audio.playback_speed,
+                        self.config.audio.pitch_step,
+                    );
+                    self.set_target_pitch(next);
+                    config_dirty = true;
+                    sync_dirty = true;
+                    ctx.request_repaint();
+                }
+                HotkeyAction::PitchDown => {
+                    let next = step_playback_speed(
+                        self.config.audio.playback_speed,
+                        -self.config.audio.pitch_step,
+                    );
+                    self.set_target_pitch(next);
+                    config_dirty = true;
+                    sync_dirty = true;
+                    ctx.request_repaint();
+                }
+                HotkeyAction::PitchReset => {
+                    self.set_target_pitch(1.0);
+                    config_dirty = true;
                     sync_dirty = true;
                     ctx.request_repaint();
                 }
@@ -492,13 +554,6 @@ impl eframe::App for WaweFxApp {
         }
 
         let accent = rgb_to_color32(self.config.theme.accent_color);
-        let (hovered_files, dropped_files, drop_pointer_pos) = ctx.input(|i| {
-            (
-                i.raw.hovered_files.clone(),
-                i.raw.dropped_files.clone(),
-                i.pointer.latest_pos().or(i.pointer.interact_pos()),
-            )
-        });
         let hovered_image_drop = hovered_files.iter().any(|f| {
             f.path.as_deref().is_some_and(is_image_file) || f.mime.starts_with("image/")
         });
@@ -506,49 +561,19 @@ impl eframe::App for WaweFxApp {
             f.path.as_deref().is_some_and(is_audio_file) || f.mime.starts_with("audio/")
         });
 
-        // Main Soundboard Canvas / Grid
-        let inner_margin = if self.config.sounds.is_empty()
-            && self.last_error.is_none()
-            && hovered_files.is_empty()
-        {
+        // Main Soundboard Canvas / Grid (never shifts layout during external file drag-hover)
+        let inner_margin = if self.config.sounds.is_empty() && self.last_error.is_none() {
             0
         } else {
             16
         };
-        let grid_action = egui::CentralPanel::default()
+        let panel_resp = egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
                     .fill(bg_main)
                     .inner_margin(egui::Margin::same(inner_margin)),
             )
             .show(ctx, |ui| {
-                if !hovered_files.is_empty() {
-                    let hint = if hovered_image_drop && !hovered_audio_drop {
-                        "Drop image onto a Sound Pad card to set its cover"
-                    } else if hovered_audio_drop && !hovered_image_drop {
-                        "Drop audio file anywhere to add a new Sound Pad"
-                    } else {
-                        "Drop audio files to add pads, or drop an image onto a pad card"
-                    };
-                    egui::Frame::NONE
-                        .fill(egui::Color32::from_rgba_unmultiplied(
-                            accent.r(),
-                            accent.g(),
-                            accent.b(),
-                            28,
-                        ))
-                        .stroke(egui::Stroke::new(1.5_f32, accent))
-                        .corner_radius(egui::CornerRadius::same(8))
-                        .inner_margin(egui::Margin::symmetric(12, 8))
-                        .show(ui, |ui| {
-                            ui.colored_label(
-                                accent,
-                                egui::RichText::new(hint).strong().size(13.0),
-                            );
-                        });
-                    ui.add_space(8.0);
-                }
-
                 if let Some(err) = self.last_error.clone() {
                     ui.horizontal(|ui| {
                         ui.colored_label(egui::Color32::from_rgb(200, 45, 45), err);
@@ -565,9 +590,15 @@ impl eframe::App for WaweFxApp {
                     &self.audio,
                     &mut self.thumbnails,
                     hovered_image_drop,
+                    drop_pointer_pos,
                 )
-            })
-            .inner;
+            });
+        let central_rect = panel_resp.response.rect;
+        let grid_action = panel_resp.inner;
+
+        if hovered_image_drop {
+            self.last_hovered_image_pad_id = grid_action.hovered_image_pad_id.clone();
+        }
 
         if grid_action.config_dirty {
             config_dirty = true;
@@ -575,10 +606,57 @@ impl eframe::App for WaweFxApp {
         }
 
         if !dropped_files.is_empty()
-            && self.handle_dropped_files(&dropped_files, drop_pointer_pos, &grid_action.pad_rects)
+            && self.handle_dropped_files(
+                ctx,
+                &dropped_files,
+                drop_pointer_pos,
+                &grid_action.pad_rects,
+            )
         {
             config_dirty = true;
             sync_dirty = true;
+        }
+        if !hovered_image_drop {
+            self.last_hovered_image_pad_id = None;
+        }
+
+        if let Some((_, created_at)) = &self.status_toast
+            && created_at.elapsed() >= Duration::from_millis(3500)
+        {
+            self.status_toast = None;
+        }
+
+        if !hovered_files.is_empty() {
+            let hint = if hovered_image_drop && !hovered_audio_drop {
+                if let Some(ref pad_id) = grid_action.hovered_image_pad_id
+                    && let Some(pad) = self.config.sounds.iter().find(|s| s.id == *pad_id)
+                {
+                    format!("Release to set cover on '{}'", pad.title)
+                } else {
+                    "Drop image onto a Sound Pad card to set its cover".to_string()
+                }
+            } else if hovered_audio_drop && !hovered_image_drop {
+                "Drop audio file anywhere to add a new Sound Pad".to_string()
+            } else {
+                "Drop audio files to add pads, or drop an image onto a pad card".to_string()
+            };
+            paint_floating_hint_pill(
+                ctx,
+                central_rect,
+                &hint,
+                accent,
+                rgb_to_color32(self.config.theme.bg_toolbar),
+                rgb_to_color32(self.config.theme.pad_text),
+            );
+        } else if let Some((ref toast, _)) = self.status_toast {
+            paint_floating_hint_pill(
+                ctx,
+                central_rect,
+                toast,
+                accent,
+                rgb_to_color32(self.config.theme.bg_toolbar),
+                rgb_to_color32(self.config.theme.pad_text),
+            );
         }
 
         if let Some(play_id) = grid_action.play_sound_id {
@@ -691,11 +769,19 @@ impl eframe::App for WaweFxApp {
         }
 
         // Animate the playing pad's bottom progress bar smoothly while audio is playing,
-        // and refresh live callback telemetry or background driver setup progress.
-        if self.audio.is_playing() {
+        // keep external drag-and-drop hover highlighting responsive at ~60 Hz,
+        // and refresh live callback telemetry or background setup progress.
+        if config_dirty || sync_dirty {
+            ctx.request_repaint();
+        }
+        if !hovered_files.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        } else if self.audio.is_playing() {
             ctx.request_repaint_after(Duration::from_millis(33));
         } else if self.driver_setup.is_running() {
             ctx.request_repaint_after(Duration::from_millis(120));
+        } else if self.status_toast.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(200));
         } else if matches!(self.active_modal, Some(ActiveModal::Alerts)) {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -706,6 +792,7 @@ impl WaweFxApp {
     /// Processes external audio/image files dropped onto the application window.
     fn handle_dropped_files(
         &mut self,
+        ctx: &egui::Context,
         dropped_files: &[egui::DroppedFile],
         drop_pos: Option<egui::Pos2>,
         pad_rects: &[(String, egui::Rect)],
@@ -751,19 +838,29 @@ impl WaweFxApp {
                     }
                 }
             } else if is_image_file(&path) {
-                let target_pad_id = drop_pos.and_then(|pos| {
-                    pad_rects
-                        .iter()
-                        .find(|(_, rect)| rect.contains(pos))
-                        .map(|(id, _)| id.clone())
-                });
+                let target_pad_id = find_drop_target_pad(
+                    drop_pos,
+                    pad_rects,
+                    self.last_hovered_image_pad_id.as_deref(),
+                );
 
                 if let Some(pad_id) = target_pad_id {
+                    let Some(color_img) = decode_thumbnail_image(&path) else {
+                        self.last_error = Some(format!(
+                            "Could not decode dropped image '{}'.",
+                            path.display()
+                        ));
+                        continue;
+                    };
+
                     match AppConfig::import_cover_file(&path) {
                         Ok(managed_cover) => {
+                            let resolved_managed = AppConfig::resolve_asset_path(&managed_cover);
+                            let mut pad_title = String::new();
                             let old_img = if let Some(sound) =
                                 self.config.sounds.iter_mut().find(|s| s.id == pad_id)
                             {
+                                pad_title = sound.title.clone();
                                 let prev = sound.image_path.replace(managed_cover.clone());
                                 if prev.as_ref() == Some(&managed_cover) {
                                     None
@@ -776,9 +873,14 @@ impl WaweFxApp {
                             if let Some(prev_path) = old_img {
                                 self.config.cleanup_managed_path(&prev_path);
                             }
-                            self.thumbnails.invalidate(&pad_id);
+                            self.thumbnails
+                                .set_decoded(ctx, &pad_id, resolved_managed, color_img);
                             self.sync.invalidate_thumbnail(&pad_id);
                             self.last_error = None;
+                            self.status_toast = Some((
+                                format!("Updated cover for '{}'", pad_title),
+                                Instant::now(),
+                            ));
                             changed = true;
                         }
                         Err(err) => {
@@ -789,14 +891,15 @@ impl WaweFxApp {
                         }
                     }
                 } else {
-                    self.last_error = Some(
+                    self.status_toast = Some((
                         "Drop an image directly onto a Sound Pad card to set its cover."
                             .to_string(),
-                    );
+                        Instant::now(),
+                    ));
                 }
             } else {
                 self.last_error = Some(format!(
-                    "Unsupported file type '{}'. Supported: mp3, wav, ogg, flac, png, jpg, jpeg, webp.",
+                    "Unsupported file type '{}'. Supported: mp3, wav, ogg, flac, png, jpg, jpeg, webp, bmp.",
                     path.display()
                 ));
             }
@@ -804,6 +907,119 @@ impl WaweFxApp {
 
         changed
     }
+}
+
+fn resolve_file_drop_pointer_pos(
+    ctx: &egui::Context,
+    active_file_drag: bool,
+) -> Option<egui::Pos2> {
+    let egui_pos = ctx.input(|i| {
+        i.pointer
+            .latest_pos()
+            .or_else(|| i.pointer.interact_pos())
+            .or_else(|| i.pointer.hover_pos())
+    });
+    if !active_file_drag {
+        return egui_pos;
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(win_pos) = windows_live_cursor_in_window(ctx) {
+        return Some(win_pos);
+    }
+
+    egui_pos
+}
+
+#[cfg(target_os = "windows")]
+fn windows_live_cursor_in_window(ctx: &egui::Context) -> Option<egui::Pos2> {
+    #[repr(C)]
+    struct WinPoint {
+        x: i32,
+        y: i32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetCursorPos(lp_point: *mut WinPoint) -> i32;
+    }
+
+    let inner_rect = ctx.input(|i| i.viewport().inner_rect)?;
+    let mut pt = WinPoint { x: 0, y: 0 };
+    // SAFETY: `pt` points to valid stack-allocated WinPoint memory for GetCursorPos.
+    if unsafe { GetCursorPos(&mut pt) } == 0 {
+        return None;
+    }
+    let ppp = ctx.pixels_per_point().max(0.1);
+    let local = egui::pos2(
+        pt.x as f32 / ppp - inner_rect.min.x,
+        pt.y as f32 / ppp - inner_rect.min.y,
+    );
+    ctx.screen_rect().expand(4.0).contains(local).then_some(local)
+}
+
+fn find_drop_target_pad(
+    drop_pos: Option<egui::Pos2>,
+    pad_rects: &[(String, egui::Rect)],
+    fallback_hovered_pad_id: Option<&str>,
+) -> Option<String> {
+    if let Some(pos) = drop_pos {
+        if let Some((id, _)) = pad_rects.iter().find(|(_, rect)| rect.contains(pos)) {
+            return Some(id.clone());
+        }
+        return pad_rects
+            .iter()
+            .filter(|(_, rect)| rect.expand(4.0).contains(pos))
+            .min_by(|(_, a), (_, b)| {
+                a.center()
+                    .distance_sq(pos)
+                    .total_cmp(&b.center().distance_sq(pos))
+            })
+            .map(|(id, _)| id.clone());
+    }
+
+    fallback_hovered_pad_id.and_then(|hovered_id| {
+        pad_rects
+            .iter()
+            .find(|(id, _)| id == hovered_id)
+            .map(|(id, _)| id.clone())
+    })
+}
+
+fn paint_floating_hint_pill(
+    ctx: &egui::Context,
+    canvas_rect: egui::Rect,
+    text: &str,
+    accent: egui::Color32,
+    surface: egui::Color32,
+    text_color: egui::Color32,
+) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("wawefx_drop_hint_pill"),
+    ));
+    let font = egui::FontId::proportional(12.5);
+    let galley = painter.layout_no_wrap(text.to_string(), font, text_color);
+    let max_w = (canvas_rect.width() - 32.0).max(160.0);
+    let pill_w = (galley.size().x + 28.0).clamp(140.0, max_w);
+    let pill_h = 30.0;
+    let center = egui::pos2(
+        canvas_rect.center().x,
+        (canvas_rect.max.y - 24.0).max(canvas_rect.min.y + 20.0),
+    );
+    let pill_rect = egui::Rect::from_center_size(center, egui::vec2(pill_w, pill_h));
+    let bg = egui::Color32::from_rgba_unmultiplied(surface.r(), surface.g(), surface.b(), 238);
+    painter.rect_filled(pill_rect, egui::CornerRadius::same(15), bg);
+    painter.rect_stroke(
+        pill_rect,
+        egui::CornerRadius::same(15),
+        egui::Stroke::new(1.5_f32, accent),
+        egui::StrokeKind::Inside,
+    );
+    let text_pos = egui::pos2(
+        pill_rect.center().x - galley.size().x * 0.5,
+        pill_rect.center().y - galley.size().y * 0.5,
+    );
+    painter.galley(text_pos, galley, text_color);
 }
 
 fn has_extension_in(path: &Path, allowed: &[&str]) -> bool {
@@ -820,7 +1036,7 @@ fn is_audio_file(path: &Path) -> bool {
 }
 
 fn is_image_file(path: &Path) -> bool {
-    has_extension_in(path, &["png", "jpg", "jpeg", "webp"])
+    has_extension_in(path, &["png", "jpg", "jpeg", "webp", "bmp"])
 }
 
 #[cfg(test)]
@@ -834,7 +1050,83 @@ mod tests {
     use image::imageops::FilterType;
     use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, Rgba, RgbaImage};
 
-    use super::{LOGO_PNG_BYTES, build_window_icon};
+    use super::{
+        LOGO_PNG_BYTES, build_window_icon, decode_thumbnail_image, find_drop_target_pad,
+        is_image_file,
+    };
+
+    #[test]
+    fn image_file_detection_is_case_insensitive_including_bmp() {
+        for ext in ["png", "PNG", "jpg", "JPEG", "webp", "WebP", "bmp", "BMP"] {
+            assert!(is_image_file(Path::new(&format!("cover.{ext}"))));
+        }
+        assert!(!is_image_file(Path::new("sound.wav")));
+        assert!(!is_image_file(Path::new("no_ext")));
+    }
+
+    #[test]
+    fn decodes_bmp_thumbnail_image() {
+        let temp_bmp =
+            std::env::temp_dir().join(format!("wawefx_test_cover_{}.bmp", uuid::Uuid::new_v4()));
+        let img = RgbaImage::from_pixel(512, 512, Rgba([64, 180, 240, 255]));
+        img.save(&temp_bmp).expect("save temp bmp");
+        let decoded = decode_thumbnail_image(&temp_bmp);
+        let _ = fs::remove_file(&temp_bmp);
+        let color_img = decoded.expect("bmp image should decode");
+        assert_eq!(color_img.size, [256, 256]);
+        assert_eq!(
+            color_img.pixels[0],
+            eframe::egui::Color32::from_rgba_unmultiplied(64, 180, 240, 255)
+        );
+    }
+
+    #[test]
+    fn find_drop_target_pad_handles_exact_tolerance_outside_and_fallback() {
+        let rects = vec![
+            (
+                "pad-1".to_string(),
+                eframe::egui::Rect::from_min_max(
+                    eframe::egui::pos2(10.0, 10.0),
+                    eframe::egui::pos2(110.0, 140.0),
+                ),
+            ),
+            (
+                "pad-2".to_string(),
+                eframe::egui::Rect::from_min_max(
+                    eframe::egui::pos2(124.0, 10.0),
+                    eframe::egui::pos2(224.0, 140.0),
+                ),
+            ),
+        ];
+
+        assert_eq!(
+            find_drop_target_pad(Some(eframe::egui::pos2(50.0, 50.0)), &rects, None).as_deref(),
+            Some("pad-1")
+        );
+        // 3 px outside pad-2's left edge matches via 4 px tolerance
+        assert_eq!(
+            find_drop_target_pad(Some(eframe::egui::pos2(121.0, 50.0)), &rects, None).as_deref(),
+            Some("pad-2")
+        );
+        // Far outside any card returns None rather than falling back wrongly
+        assert_eq!(
+            find_drop_target_pad(
+                Some(eframe::egui::pos2(400.0, 400.0)),
+                &rects,
+                Some("pad-1")
+            ),
+            None
+        );
+        // When OS gives no pointer coordinates on drop, uses the last hovered visible pad
+        assert_eq!(
+            find_drop_target_pad(None, &rects, Some("pad-2")).as_deref(),
+            Some("pad-2")
+        );
+        assert_eq!(
+            find_drop_target_pad(None, &rects, Some("scrolled-off-pad")),
+            None
+        );
+    }
 
     fn rounded_rect_coverage(px: u32, py: u32, size: u32, radius: f32) -> f32 {
         let half = size as f32 * 0.5;

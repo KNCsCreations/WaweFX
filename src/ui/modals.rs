@@ -5,7 +5,10 @@ use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
 use qrcode::{Color as QrColor, QrCode};
 
 use crate::audio::{AudioDeviceList, AudioEngine, AudioEngineStatus, apo_installer};
-use crate::config::{AppConfig, SoundItem, ThemeConfig, ThemePreset, rgb_to_color32};
+use crate::config::{
+    AppConfig, MAX_PITCH_STEP, MIN_PITCH_STEP, ShortcutOwner, SoundItem, ThemeConfig, ThemePreset,
+    rgb_to_color32,
+};
 use crate::hotkeys::{self, HotkeyStatus, ShortcutCapture};
 use crate::updater::{self, CURRENT_VERSION, GITHUB_REPO_SLUG, UpdateCheckState};
 
@@ -429,13 +432,13 @@ fn render_sound_editor_modal(
                             .as_ref()
                             .and_then(|p| p.file_name())
                             .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "Optional (.png / .jpg / .webp)".to_string());
+                            .unwrap_or_else(|| "Optional (.png / .jpg / .webp / .bmp)".to_string());
                         ui.add(
                             egui::Label::new(egui::RichText::new(img_label).weak()).truncate(),
                         );
                         if ui.button("Browse Image...").clicked()
                             && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Image Files", &["png", "jpg", "jpeg", "webp"])
+                                .add_filter("Image Files", &["png", "jpg", "jpeg", "webp", "bmp"])
                                 .pick_file()
                         {
                             draft.image_path = Some(path);
@@ -475,7 +478,10 @@ fn render_sound_editor_modal(
                         draft.error_message = None;
                         draft.shortcut_conflict_notice = draft.shortcut.as_deref().and_then(|sc| {
                             config
-                                .shortcut_conflict_label(sc, draft.editing_id.as_deref(), true)
+                                .shortcut_conflict_label(
+                                    sc,
+                                    draft.editing_id.as_deref().map(ShortcutOwner::Sound),
+                                )
                                 .map(|owner| {
                                     format!(
                                         "Note: '{sc}' is currently assigned to {owner} and will be reassigned on save."
@@ -611,6 +617,32 @@ fn render_shortcut_picker(
     changed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalHotkeySlot {
+    StopAll,
+    PitchUp,
+    PitchDown,
+    PitchReset,
+}
+
+fn global_shortcut_ref(config: &AppConfig, slot: GlobalHotkeySlot) -> &Option<String> {
+    match slot {
+        GlobalHotkeySlot::StopAll => &config.stop_shortcut,
+        GlobalHotkeySlot::PitchUp => &config.pitch_up_shortcut,
+        GlobalHotkeySlot::PitchDown => &config.pitch_down_shortcut,
+        GlobalHotkeySlot::PitchReset => &config.pitch_reset_shortcut,
+    }
+}
+
+fn global_shortcut_mut(config: &mut AppConfig, slot: GlobalHotkeySlot) -> &mut Option<String> {
+    match slot {
+        GlobalHotkeySlot::StopAll => &mut config.stop_shortcut,
+        GlobalHotkeySlot::PitchUp => &mut config.pitch_up_shortcut,
+        GlobalHotkeySlot::PitchDown => &mut config.pitch_down_shortcut,
+        GlobalHotkeySlot::PitchReset => &mut config.pitch_reset_shortcut,
+    }
+}
+
 fn render_settings_modal(
     ctx: &egui::Context,
     config: &mut AppConfig,
@@ -626,7 +658,7 @@ fn render_settings_modal(
         .resizable(true)
         .frame(themed_modal_frame(ctx, &config.theme))
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-        .default_size(Vec2::new(530.0, 470.0))
+        .default_size(Vec2::new(540.0, 420.0))
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // --- Section 1: Audio Routing Devices ---
@@ -792,97 +824,194 @@ fn render_settings_modal(
                 ui.separator();
                 ui.add_space(6.0);
 
-                // --- Section 2: Global Hotkeys (Stop All Sounds) ---
+                // --- Section 2: Global Hotkeys (Stop All & Pitch Control) ---
                 ui.heading("Global Hotkeys");
                 ui.add_space(4.0);
 
-                let stop_rec_key = egui::Id::new("wawefx_stop_hotkey_recording");
-                let stop_input_key = egui::Id::new("wawefx_stop_hotkey_input_buf");
-                let stop_err_key = egui::Id::new("wawefx_stop_hotkey_err");
-                let stop_note_key = egui::Id::new("wawefx_stop_hotkey_note");
+                const GLOBAL_HOTKEY_ROWS: [(&str, GlobalHotkeySlot, ShortcutOwner<'static>, &str); 4] = [
+                    ("Stop All Sounds:", GlobalHotkeySlot::StopAll, ShortcutOwner::StopAll, "stop"),
+                    ("Pitch Up (+):", GlobalHotkeySlot::PitchUp, ShortcutOwner::PitchUp, "pitch_up"),
+                    ("Pitch Down (-):", GlobalHotkeySlot::PitchDown, ShortcutOwner::PitchDown, "pitch_down"),
+                    ("Pitch Reset (1.00x):", GlobalHotkeySlot::PitchReset, ShortcutOwner::PitchReset, "pitch_reset"),
+                ];
 
-                let mut recording_stop: bool = ctx.data_mut(|d| d.get_temp(stop_rec_key).unwrap_or(false));
-                let mut stop_input: String = ctx.data_mut(|d| {
-                    d.get_temp(stop_input_key)
-                        .unwrap_or_else(|| config.stop_shortcut.clone().unwrap_or_default())
-                });
-                let mut stop_err: Option<String> = ctx.data_mut(|d| d.get_temp(stop_err_key).unwrap_or(None));
-                let mut stop_note: Option<String> = ctx.data_mut(|d| d.get_temp(stop_note_key).unwrap_or(None));
+                let rec_slot_key = egui::Id::new("wawefx_settings_hotkey_rec_slot");
+                let note_key = egui::Id::new("wawefx_settings_hotkey_note");
+                let mut rec_slot: Option<GlobalHotkeySlot> = ctx
+                    .data_mut(|d| d.get_temp::<Option<GlobalHotkeySlot>>(rec_slot_key))
+                    .flatten();
+                let mut global_note: Option<String> = ctx
+                    .data_mut(|d| d.get_temp::<Option<String>>(note_key))
+                    .flatten();
+                let mut pending_assignment: Option<(GlobalHotkeySlot, ShortcutOwner<'static>, Option<String>)> = None;
+                let mut validation_errors: Vec<String> = Vec::new();
 
-                // Keep buffer synced when stop_shortcut was cleared externally by a sound shortcut conflict
-                if !recording_stop
-                    && stop_err.is_none()
-                    && config.stop_shortcut.as_deref() != Some(stop_input.trim())
-                    && (config.stop_shortcut.is_none() && !stop_input.is_empty() && hotkeys::parse_shortcut(&stop_input).is_ok()
-                        || config.stop_shortcut.is_some() && stop_input.is_empty())
-                {
-                    stop_input = config.stop_shortcut.clone().unwrap_or_default();
+                egui::Grid::new("settings_global_hotkeys_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        for &(label, slot, owner, tag) in &GLOBAL_HOTKEY_ROWS {
+                            ui.label(label);
+                            let input_key = egui::Id::new(("wawefx_ghk_input", tag));
+                            let err_key = egui::Id::new(("wawefx_ghk_err", tag));
+
+                            let stored_val = global_shortcut_ref(config, slot).clone();
+                            let was_recording = rec_slot == Some(slot);
+                            let mut recording = was_recording;
+                            let mut input_buf: String = ctx.data_mut(|d| {
+                                d.get_temp(input_key)
+                                    .unwrap_or_else(|| stored_val.clone().unwrap_or_default())
+                            });
+                            let mut slot_err: Option<String> = ctx
+                                .data_mut(|d| d.get_temp::<Option<String>>(err_key))
+                                .flatten();
+
+                            if !recording
+                                && slot_err.is_none()
+                                && stored_val.as_deref() != Some(input_buf.trim())
+                                && (stored_val.is_none()
+                                    && !input_buf.is_empty()
+                                    && hotkeys::parse_shortcut(&input_buf).is_ok()
+                                    || stored_val.is_some() && input_buf.is_empty())
+                            {
+                                input_buf = stored_val.clone().unwrap_or_default();
+                            }
+
+                            let mut next_val = stored_val;
+                            if render_shortcut_picker(
+                                ctx,
+                                ui,
+                                egui::Id::new(("settings_shortcut_picker", tag)),
+                                &mut input_buf,
+                                &mut next_val,
+                                &mut recording,
+                                &mut slot_err,
+                            ) {
+                                pending_assignment = Some((slot, owner, next_val));
+                            }
+
+                            if recording && !was_recording {
+                                rec_slot = Some(slot);
+                            } else if !recording && was_recording {
+                                rec_slot = None;
+                            }
+
+                            if let Some(ref err) = slot_err {
+                                validation_errors.push(format!("{label} {err}"));
+                            }
+
+                            ctx.data_mut(|d| {
+                                d.insert_temp(input_key, input_buf);
+                                d.insert_temp(err_key, slot_err);
+                            });
+                            ui.end_row();
+                        }
+
+                        ui.label("Pitch Hotkey Step:");
+                        ui.horizontal(|ui| {
+                            let slider = egui::Slider::new(
+                                &mut config.audio.pitch_step,
+                                MIN_PITCH_STEP..=MAX_PITCH_STEP,
+                            )
+                            .step_by(0.01)
+                            .fixed_decimals(2)
+                            .suffix("x");
+                            if ui.add(slider).changed() {
+                                outcome.config_dirty = true;
+                            }
+                            for preset_step in [0.05f32, 0.10, 0.25] {
+                                let selected = (config.audio.pitch_step - preset_step).abs() < 0.005;
+                                if ui
+                                    .selectable_label(selected, format!("{preset_step:.2}x"))
+                                    .clicked()
+                                {
+                                    config.audio.pitch_step = preset_step;
+                                    outcome.config_dirty = true;
+                                }
+                            }
+                        });
+                        ui.end_row();
+                    });
+
+                if let Some((slot, owner, next_val)) = pending_assignment {
+                    *global_shortcut_mut(config, slot) = next_val.clone();
+                    global_note = if let Some(ref sc) = next_val {
+                        let unbound = config.unbind_shortcut_conflicts(sc, Some(owner));
+                        if unbound.is_empty() {
+                            None
+                        } else {
+                            Some(format!("Unbound '{sc}' from: {}.", unbound.join(", ")))
+                        }
+                    } else {
+                        None
+                    };
+                    outcome.config_dirty = true;
                 }
 
-                ui.horizontal(|ui| {
-                    ui.label("Stop All Sounds:");
-                    let mut stop_val = config.stop_shortcut.clone();
-                    if render_shortcut_picker(
-                        ctx,
-                        ui,
-                        egui::Id::new("settings_stop_shortcut"),
-                        &mut stop_input,
-                        &mut stop_val,
-                        &mut recording_stop,
-                        &mut stop_err,
-                    ) {
-                        config.stop_shortcut = stop_val.clone();
-                        stop_note = if let Some(ref sc) = stop_val {
-                            let unbound = config.unbind_shortcut_conflicts(sc, None, true);
-                            if unbound.is_empty() {
-                                None
-                            } else {
-                                Some(format!(
-                                    "Unbound '{sc}' from: {}.",
-                                    unbound.join(", ")
-                                ))
-                            }
-                        } else {
-                            None
-                        };
-                        outcome.config_dirty = true;
-                    }
-                });
-                if let Some(ref note) = stop_note {
+                if let Some(ref note) = global_note {
                     ui.colored_label(Color32::from_rgb(235, 140, 50), note);
                 }
-                if let Some(ref err) = stop_err {
+                for err in &validation_errors {
                     ui.colored_label(Color32::from_rgb(220, 70, 70), err);
                 }
-                ui.small("Trigger any assigned sound pad or Stop All from anywhere on your system (e.g. Ctrl+Shift+1, F9, Numpad0).");
+                ui.small("Trigger Stop All, Pitch Up/Down/Reset, or any sound pad from anywhere on your system (e.g. Ctrl+Shift+1, F9–F24, Numpad0).");
 
                 ctx.data_mut(|d| {
-                    d.insert_temp(stop_rec_key, recording_stop);
-                    d.insert_temp(stop_input_key, stop_input);
-                    d.insert_temp(stop_err_key, stop_err);
-                    d.insert_temp(stop_note_key, stop_note);
+                    d.insert_temp(rec_slot_key, rec_slot);
+                    d.insert_temp(note_key, global_note);
                 });
 
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(6.0);
 
-                // --- Section 3: Color Themes (3 Presets + Custom RGB Pickers) ---
+                // --- Section 3: Color Themes (Built-in + User Presets + Custom RGB Pickers) ---
                 ui.heading("Theme & Colors");
                 ui.add_space(4.0);
 
+                let mut delete_preset_idx: Option<usize> = None;
+                let user_presets_snapshot = config.user_presets.clone();
                 ui.horizontal_wrapped(|ui| {
                     for preset in ThemePreset::BUILTIN_PRESETS {
-                        let active = config.theme.preset == preset;
+                        let active = config.theme.preset == preset
+                            && config.theme.active_user_preset.is_none();
                         if ui.selectable_label(active, preset.label()).clicked() {
                             config.theme.apply_preset(preset);
                             outcome.config_dirty = true;
                         }
                     }
-                    if config.theme.preset == ThemePreset::Custom {
+                    for (idx, named) in user_presets_snapshot.iter().enumerate() {
+                        let active = config
+                            .theme
+                            .active_user_preset
+                            .as_deref()
+                            .is_some_and(|n| n.eq_ignore_ascii_case(&named.name));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            if ui.selectable_label(active, &named.name).clicked() {
+                                config.theme.apply_named_preset(named);
+                                outcome.config_dirty = true;
+                            }
+                            if ui
+                                .small_button("×")
+                                .on_hover_text(format!("Delete preset '{}'", named.name))
+                                .clicked()
+                            {
+                                delete_preset_idx = Some(idx);
+                            }
+                        });
+                    }
+                    if config.theme.preset == ThemePreset::Custom
+                        && config.theme.active_user_preset.is_none()
+                    {
                         ui.label(egui::RichText::new("• Custom").strong());
                     }
                 });
+                if let Some(idx) = delete_preset_idx
+                    && config.delete_user_preset(idx)
+                {
+                    outcome.config_dirty = true;
+                }
 
                 ui.add_space(8.0);
                 let mut color_changed = false;
@@ -916,9 +1045,38 @@ fn render_settings_modal(
                     });
 
                 if color_changed {
-                    config.theme.mark_custom_if_changed();
+                    config
+                        .theme
+                        .mark_custom_if_changed_with_presets(&config.user_presets);
                     outcome.config_dirty = true;
                 }
+
+                ui.add_space(8.0);
+                let new_preset_id = egui::Id::new("wawefx_new_theme_preset_name");
+                let mut preset_name: String = ctx
+                    .data_mut(|d| d.get_temp::<String>(new_preset_id))
+                    .unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Save Current Colors:");
+                    let edit_resp = ui.add(
+                        egui::TextEdit::singleline(&mut preset_name)
+                            .id(new_preset_id.with("input"))
+                            .hint_text("Preset name...")
+                            .desired_width(180.0),
+                    );
+                    let can_save = !preset_name.trim().is_empty();
+                    let enter_submitted = can_save
+                        && edit_resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let btn_clicked = ui
+                        .add_enabled(can_save, primary_accent_button("Save Preset", &config.theme))
+                        .clicked();
+                    if (btn_clicked || enter_submitted) && config.save_user_preset(&preset_name) {
+                        preset_name.clear();
+                        outcome.config_dirty = true;
+                    }
+                });
+                ctx.data_mut(|d| d.insert_temp(new_preset_id, preset_name));
 
                 ui.add_space(12.0);
                 ui.separator();
@@ -963,8 +1121,8 @@ fn render_settings_modal(
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Reset to Warm Beige").clicked() {
-                        config.theme.apply_preset(ThemePreset::WarmBeige);
+                    if ui.button("Reset to Midnight Dark").clicked() {
+                        config.theme.apply_preset(ThemePreset::MidnightDark);
                         outcome.config_dirty = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

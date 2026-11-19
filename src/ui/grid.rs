@@ -20,6 +20,7 @@ pub struct GridAction {
     pub clear_shortcut_id: Option<String>,
     pub remove_sound_id: Option<String>,
     pub pad_rects: Vec<(String, Rect)>,
+    pub hovered_image_pad_id: Option<String>,
     pub config_dirty: bool,
 }
 
@@ -30,6 +31,7 @@ pub fn render_sound_grid(
     audio: &AudioEngine,
     thumbnails: &mut ThumbnailLoader,
     hovered_image_drop: bool,
+    drop_pointer_pos: Option<Pos2>,
 ) -> GridAction {
     let mut action = GridAction::default();
 
@@ -109,9 +111,13 @@ pub fn render_sound_grid(
                             Vec2::new(card_width, card_height),
                             Sense::click_and_drag(),
                         );
-                        action.pad_rects.push((sound.id.clone(), rect));
+                        let visible_rect = rect.intersect(ui.clip_rect());
+                        if visible_rect.is_positive() {
+                            action.pad_rects.push((sound.id.clone(), visible_rect));
+                        }
 
-                        let pointer_over_card = pointer_pos.is_some_and(|p| rect.contains(p));
+                        let pointer_over_card = visible_rect.is_positive()
+                            && pointer_pos.is_some_and(|p| visible_rect.contains(p));
                         if drag_state.active_id.is_none()
                             && ((primary_pressed && pointer_over_card)
                                 || resp.drag_started_by(egui::PointerButton::Primary))
@@ -123,7 +129,14 @@ pub fn render_sound_grid(
 
                         let is_drop_hover_target =
                             dragging_src_idx.is_some() && !is_being_dragged && pointer_over_card;
-                        let is_image_drop_target = hovered_image_drop && pointer_over_card;
+                        let is_image_drop_target = hovered_image_drop
+                            && visible_rect.is_positive()
+                            && action.hovered_image_pad_id.is_none()
+                            && drop_pointer_pos
+                                .is_some_and(|p| visible_rect.expand(4.0).contains(p));
+                        if is_image_drop_target {
+                            action.hovered_image_pad_id = Some(sound.id.clone());
+                        }
 
                         let fill = if is_being_dragged {
                             dim_color(card_bg, 0.55)
@@ -135,7 +148,7 @@ pub fn render_sound_grid(
 
                         let painter = ui.painter();
 
-                        if is_playing_this {
+                        if is_playing_this || is_image_drop_target {
                             painter.rect_filled(
                                 rect.expand(2.5),
                                 CornerRadius::same(12),
@@ -143,16 +156,16 @@ pub fn render_sound_grid(
                                     accent.r(),
                                     accent.g(),
                                     accent.b(),
-                                    85,
+                                    if is_image_drop_target { 115 } else { 85 },
                                 ),
                             );
                         }
 
                         painter.rect_filled(rect, CornerRadius::same(10), fill);
 
-                        let border_stroke = if is_drop_hover_target {
-                            Stroke::new(2.6_f32, accent)
-                        } else if is_image_drop_target || is_playing_this {
+                        let border_stroke = if is_drop_hover_target || is_image_drop_target {
+                            Stroke::new(2.8_f32, accent)
+                        } else if is_playing_this {
                             Stroke::new(2.2_f32, accent)
                         } else if is_selected {
                             Stroke::new(1.8_f32, icon_primary)
@@ -202,6 +215,33 @@ pub fn render_sound_grid(
                                 painter,
                                 img_rect.center(),
                                 if is_playing_this { accent } else { icon_primary },
+                            );
+                        }
+
+                        if is_image_drop_target {
+                            painter.rect_filled(
+                                img_rect,
+                                CornerRadius::same(6),
+                                Color32::from_rgba_unmultiplied(18, 22, 30, 155),
+                            );
+                            let pill_w = (img_rect.width() - 12.0).clamp(64.0, 118.0);
+                            let overlay_pill =
+                                Rect::from_center_size(img_rect.center(), Vec2::new(pill_w, 24.0));
+                            painter.rect_filled(overlay_pill, CornerRadius::same(6), accent);
+                            let luma = 0.299 * accent.r() as f32
+                                + 0.587 * accent.g() as f32
+                                + 0.114 * accent.b() as f32;
+                            let pill_fg = if luma > 175.0 {
+                                Color32::from_rgb(0x2B, 0x25, 0x20)
+                            } else {
+                                Color32::WHITE
+                            };
+                            painter.text(
+                                overlay_pill.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Drop Cover Image",
+                                egui::FontId::proportional(10.5),
+                                pill_fg,
                             );
                         }
 

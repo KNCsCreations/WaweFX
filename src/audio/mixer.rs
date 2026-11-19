@@ -404,6 +404,79 @@ fn soft_clip(x: f32) -> f32 {
     }
 }
 
+/// Duration (milliseconds) over which active audio playback pitch glides smoothly to a new target.
+pub const PITCH_RAMP_MS: f64 = 50.0;
+
+/// Per-frame linear pitch/speed smoother to avoid instantaneous clicks or zipper noise
+/// when playback speed changes rapidly via sliders or global pitch hotkeys.
+#[derive(Debug, Clone)]
+pub struct PitchSmoother {
+    current: f64,
+    target: f64,
+    step_per_frame: f64,
+    frames_remaining: usize,
+    ramp_frames: usize,
+}
+
+impl PitchSmoother {
+    pub fn new(initial_speed: f64, out_sample_rate: f64) -> Self {
+        let clamped = initial_speed.clamp(MIN_PLAYBACK_SPEED as f64, MAX_PLAYBACK_SPEED as f64);
+        let ramp_frames = ((out_sample_rate.max(1.0) * PITCH_RAMP_MS) / 1000.0)
+            .round()
+            .max(1.0) as usize;
+        Self {
+            current: clamped,
+            target: clamped,
+            step_per_frame: 0.0,
+            frames_remaining: 0,
+            ramp_frames,
+        }
+    }
+
+    pub fn set_target(&mut self, next_target: f64) {
+        let clamped = next_target.clamp(MIN_PLAYBACK_SPEED as f64, MAX_PLAYBACK_SPEED as f64);
+        if (clamped - self.target).abs() <= 1e-6 {
+            return;
+        }
+        self.target = clamped;
+        if (clamped - self.current).abs() <= 1e-6 {
+            self.current = clamped;
+            self.step_per_frame = 0.0;
+            self.frames_remaining = 0;
+        } else {
+            self.frames_remaining = self.ramp_frames;
+            self.step_per_frame = (clamped - self.current) / self.ramp_frames as f64;
+        }
+    }
+
+    pub fn snap_to(&mut self, speed: f64) {
+        let clamped = speed.clamp(MIN_PLAYBACK_SPEED as f64, MAX_PLAYBACK_SPEED as f64);
+        self.current = clamped;
+        self.target = clamped;
+        self.step_per_frame = 0.0;
+        self.frames_remaining = 0;
+    }
+
+    #[inline]
+    pub fn next_speed(&mut self) -> f64 {
+        if self.frames_remaining > 0 {
+            self.frames_remaining -= 1;
+            if self.frames_remaining == 0 {
+                self.current = self.target;
+                self.step_per_frame = 0.0;
+            } else {
+                self.current += self.step_per_frame;
+            }
+        }
+        self.current
+    }
+
+    #[inline]
+    pub fn current(&self) -> f64 {
+        self.current
+    }
+}
+
 struct SharedMixerState {
     speed_bits: AtomicU32,
     mic_volume_bits: AtomicU32,
@@ -1237,6 +1310,7 @@ where
     let mut local_pos_frames = 0.0f64;
 
     let mut mic_resampler = MicPassthroughResampler::new();
+    let mut pitch_smoother = PitchSmoother::new(shared.speed() as f64, out_rate);
 
     let stream = device
         .build_output_stream(
@@ -1264,8 +1338,14 @@ where
 
                 let playing_flag = shared.is_playing.load(Ordering::Acquire)
                     && !shared.scrub_paused.load(Ordering::Acquire);
-                let speed = shared.speed().clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED) as f64;
-                let frame_step = speed * base_rate_step;
+                let target_speed = shared
+                    .speed()
+                    .clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED) as f64;
+                if !playing_flag || local_sound.is_none() {
+                    pitch_smoother.snap_to(target_speed);
+                } else {
+                    pitch_smoother.set_target(target_speed);
+                }
                 let is_leader = shared.leader_stream.load(Ordering::Acquire) == role_leader_id;
 
                 let (stream_enabled, stream_vol) = match role {
@@ -1300,6 +1380,7 @@ where
                     let mut sound_r = 0.0f32;
 
                     if playing_flag && let Some(ref snd) = local_sound {
+                        let frame_step = pitch_smoother.next_speed() * base_rate_step;
                         if let Some((l, r)) = sample_stereo_linear(&snd.samples, local_pos_frames) {
                             let gain = if stream_enabled {
                                 stream_vol * snd.volume_trim
@@ -1586,6 +1667,62 @@ mod tests {
             (measured - tone_hz).abs() < 4.0,
             "expected continuous ~{tone_hz} Hz after packet boundary underrun, got {measured:.2} Hz"
         );
+    }
+
+    #[test]
+    fn pitch_smoother_ramps_smoothly_over_50ms_without_jumps() {
+        let out_rate = 48_000.0;
+        let expected_ramp_frames = 2_400usize; // 50 ms at 48 kHz
+        let mut smoother = PitchSmoother::new(1.0, out_rate);
+        assert_eq!(smoother.current(), 1.0);
+
+        smoother.set_target(1.25);
+        let mut prev = smoother.current();
+        let mut max_delta = 0.0f64;
+
+        for frame in 1..=expected_ramp_frames {
+            let next = smoother.next_speed();
+            assert!(
+                next >= prev - 1e-12 && next <= 1.25 + 1e-12,
+                "ramp must stay monotonic"
+            );
+            max_delta = max_delta.max((next - prev).abs());
+            if frame == expected_ramp_frames / 2 {
+                assert!(
+                    (next - 1.125).abs() < 1e-3,
+                    "expected ~1.125 at midpoint, got {next}"
+                );
+            }
+            prev = next;
+        }
+        assert!(
+            (smoother.current() - 1.25).abs() < 1e-9,
+            "expected exact target after 50 ms"
+        );
+        assert!(max_delta < 0.001, "per-frame step too large: {max_delta}");
+
+        // Retargeting mid-ramp remains continuous without instantaneous jumps.
+        smoother.set_target(1.75);
+        for _ in 0..1000 {
+            smoother.next_speed();
+        }
+        let before_retarget = smoother.current();
+        smoother.set_target(0.75);
+        let first_after = smoother.next_speed();
+        assert!(
+            (first_after - before_retarget).abs() < 0.002,
+            "mid-ramp retarget jumped from {before_retarget} to {first_after}"
+        );
+
+        // Out-of-range targets clamp to [MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED].
+        smoother.set_target(9.0);
+        for _ in 0..expected_ramp_frames {
+            smoother.next_speed();
+        }
+        assert_eq!(smoother.current(), MAX_PLAYBACK_SPEED as f64);
+
+        smoother.snap_to(0.1);
+        assert_eq!(smoother.current(), MIN_PLAYBACK_SPEED as f64);
     }
 }
 
