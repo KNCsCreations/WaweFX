@@ -465,6 +465,7 @@ impl eframe::App for WaweFxApp {
             || !self.hotkeys.status().warnings.is_empty();
         let bg_toolbar = rgb_to_color32(self.config.theme.bg_toolbar);
         let bg_main = rgb_to_color32(self.config.theme.bg_main);
+        let is_any_modal_open = self.active_modal.is_some();
 
         // Top Pixel-Accurate Toolbar
         let available_update = self.updater.available_update();
@@ -473,6 +474,9 @@ impl eframe::App for WaweFxApp {
             .show_separator_line(false)
             .frame(egui::Frame::NONE.fill(bg_toolbar))
             .show(ctx, |ui| {
+                if is_any_modal_open {
+                    ui.disable();
+                }
                 toolbar::render_toolbar(
                     ui,
                     &mut self.config,
@@ -545,6 +549,9 @@ impl eframe::App for WaweFxApp {
             .show_separator_line(false)
             .frame(egui::Frame::NONE.fill(bg_main))
             .show(ctx, |ui| {
+                if is_any_modal_open {
+                    ui.disable();
+                }
                 toolbar::render_vertical_pitch_panel(ui, &mut self.config, &self.audio)
             })
             .inner;
@@ -554,12 +561,14 @@ impl eframe::App for WaweFxApp {
         }
 
         let accent = rgb_to_color32(self.config.theme.accent_color);
-        let hovered_image_drop = hovered_files.iter().any(|f| {
-            f.path.as_deref().is_some_and(is_image_file) || f.mime.starts_with("image/")
-        });
-        let hovered_audio_drop = hovered_files.iter().any(|f| {
-            f.path.as_deref().is_some_and(is_audio_file) || f.mime.starts_with("audio/")
-        });
+        let hovered_image_drop = !is_any_modal_open
+            && hovered_files.iter().any(|f| {
+                f.path.as_deref().is_some_and(is_image_file) || f.mime.starts_with("image/")
+            });
+        let hovered_audio_drop = !is_any_modal_open
+            && hovered_files.iter().any(|f| {
+                f.path.as_deref().is_some_and(is_audio_file) || f.mime.starts_with("audio/")
+            });
 
         // Main Soundboard Canvas / Grid (never shifts layout during external file drag-hover)
         let inner_margin = if self.config.sounds.is_empty() && self.last_error.is_none() {
@@ -574,6 +583,9 @@ impl eframe::App for WaweFxApp {
                     .inner_margin(egui::Margin::same(inner_margin)),
             )
             .show(ctx, |ui| {
+                if is_any_modal_open {
+                    ui.disable();
+                }
                 if let Some(err) = self.last_error.clone() {
                     ui.horizontal(|ui| {
                         ui.colored_label(egui::Color32::from_rgb(200, 45, 45), err);
@@ -605,7 +617,8 @@ impl eframe::App for WaweFxApp {
             sync_dirty = true;
         }
 
-        if !dropped_files.is_empty()
+        if !is_any_modal_open
+            && !dropped_files.is_empty()
             && self.handle_dropped_files(
                 ctx,
                 &dropped_files,
@@ -626,7 +639,7 @@ impl eframe::App for WaweFxApp {
             self.status_toast = None;
         }
 
-        if !hovered_files.is_empty() {
+        if !is_any_modal_open && !hovered_files.is_empty() {
             let hint = if hovered_image_drop && !hovered_audio_drop {
                 if let Some(ref pad_id) = grid_action.hovered_image_pad_id
                     && let Some(pad) = self.config.sounds.iter().find(|s| s.id == *pad_id)
@@ -692,7 +705,10 @@ impl eframe::App for WaweFxApp {
             sync_dirty = true;
         }
 
-        // Render active modal window
+        // Render dimmed backdrop & active modal window
+        if self.active_modal.is_some() {
+            render_modal_backdrop(ctx);
+        }
         if let Some(mut modal) = self.active_modal.take() {
             let bound_port = self.sync.bound_port();
             let connected_clients = self.sync.connected_clients();
@@ -748,6 +764,8 @@ impl eframe::App for WaweFxApp {
                 self.active_modal = Some(ActiveModal::Settings);
             } else if !outcome.close_modal {
                 self.active_modal = Some(modal);
+            } else {
+                ctx.request_repaint();
             }
         }
 
@@ -907,6 +925,24 @@ impl WaweFxApp {
 
         changed
     }
+}
+
+fn render_modal_backdrop(ctx: &egui::Context) {
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("wawefx_modal_backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .movable(false)
+        .interactable(true)
+        .show(ctx, |ui| {
+            ui.set_min_size(screen.size());
+            ui.painter().rect_filled(
+                screen,
+                egui::CornerRadius::ZERO,
+                egui::Color32::from_black_alpha(110),
+            );
+            ui.allocate_rect(screen, egui::Sense::click_and_drag());
+        });
 }
 
 fn resolve_file_drop_pointer_pos(

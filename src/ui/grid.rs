@@ -67,15 +67,24 @@ pub fn render_sound_grid(
     }
 
     let drag_key = Id::new("wawefx_pad_drag_state");
-    let mut drag_state: PadDragState = ui.data_mut(|d| d.get_temp(drag_key)).unwrap_or_default();
-    let (pointer_pos, press_origin, primary_down, primary_pressed) = ui.input(|i| {
-        (
-            i.pointer.latest_pos().or(i.pointer.interact_pos()),
-            i.pointer.press_origin(),
-            i.pointer.primary_down(),
-            i.pointer.primary_pressed(),
-        )
-    });
+    let grid_enabled = ui.is_enabled();
+    let mut drag_state: PadDragState = if grid_enabled {
+        ui.data_mut(|d| d.get_temp(drag_key)).unwrap_or_default()
+    } else {
+        PadDragState::default()
+    };
+    let (pointer_pos, press_origin, primary_down, primary_pressed) = if grid_enabled {
+        ui.input(|i| {
+            (
+                i.pointer.latest_pos().or(i.pointer.interact_pos()),
+                i.pointer.press_origin(),
+                i.pointer.primary_down(),
+                i.pointer.primary_pressed(),
+            )
+        })
+    } else {
+        (None, None, false, false)
+    };
 
     if primary_down
         && drag_state.active_id.is_none()
@@ -107,18 +116,25 @@ pub fn render_sound_grid(
                         let is_being_dragged =
                             drag_state.active_id.as_deref() == Some(sound.id.as_str());
 
+                        let card_sense = if grid_enabled {
+                            Sense::click_and_drag()
+                        } else {
+                            Sense::hover()
+                        };
                         let (rect, resp) = ui.allocate_exact_size(
                             Vec2::new(card_width, card_height),
-                            Sense::click_and_drag(),
+                            card_sense,
                         );
                         let visible_rect = rect.intersect(ui.clip_rect());
                         if visible_rect.is_positive() {
                             action.pad_rects.push((sound.id.clone(), visible_rect));
                         }
 
-                        let pointer_over_card = visible_rect.is_positive()
+                        let pointer_over_card = grid_enabled
+                            && visible_rect.is_positive()
                             && pointer_pos.is_some_and(|p| visible_rect.contains(p));
-                        if drag_state.active_id.is_none()
+                        if grid_enabled
+                            && drag_state.active_id.is_none()
                             && ((primary_pressed && pointer_over_card)
                                 || resp.drag_started_by(egui::PointerButton::Primary))
                             && drag_state.candidate_id.as_deref() != Some(sound.id.as_str())
@@ -362,46 +378,50 @@ pub fn render_sound_grid(
                             .selectable(false),
                         );
 
-                        // Left-click (without drag): select AND play immediately
-                        if resp.clicked() {
-                            config.selected_sound_id = Some(sound.id.clone());
-                            action.play_sound_id = Some(sound.id.clone());
-                            action.config_dirty = true;
-                        }
-
-                        // Right-click: select and open context menu
-                        if resp.secondary_clicked() {
-                            config.selected_sound_id = Some(sound.id.clone());
-                            action.config_dirty = true;
-                        }
-
-                        resp.context_menu(|ui| {
-                            if ui.button("Play").clicked() {
+                        if grid_enabled {
+                            // Left-click (without drag): select AND play immediately
+                            if resp.clicked() {
+                                config.selected_sound_id = Some(sound.id.clone());
                                 action.play_sound_id = Some(sound.id.clone());
-                                ui.close_menu();
+                                action.config_dirty = true;
                             }
-                            if is_playing_this && ui.button("Stop").clicked() {
-                                action.stop_playback = true;
-                                ui.close_menu();
+
+                            // Right-click: select and open context menu
+                            if resp.secondary_clicked() {
+                                config.selected_sound_id = Some(sound.id.clone());
+                                action.config_dirty = true;
                             }
-                            if ui.button("Edit Sound (...)").clicked() {
-                                action.edit_sound_id = Some(sound.id.clone());
-                                ui.close_menu();
-                            }
-                            if ui.button("Record Shortcut...").clicked() {
-                                action.assign_shortcut_id = Some(sound.id.clone());
-                                ui.close_menu();
-                            }
-                            if sound.shortcut.is_some() && ui.button("Clear Shortcut").clicked() {
-                                action.clear_shortcut_id = Some(sound.id.clone());
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button("Remove Sound (-)").clicked() {
-                                action.remove_sound_id = Some(sound.id.clone());
-                                ui.close_menu();
-                            }
-                        });
+
+                            resp.context_menu(|ui| {
+                                if ui.button("Play").clicked() {
+                                    action.play_sound_id = Some(sound.id.clone());
+                                    ui.close_menu();
+                                }
+                                if is_playing_this && ui.button("Stop").clicked() {
+                                    action.stop_playback = true;
+                                    ui.close_menu();
+                                }
+                                if ui.button("Edit Sound (...)").clicked() {
+                                    action.edit_sound_id = Some(sound.id.clone());
+                                    ui.close_menu();
+                                }
+                                if ui.button("Record Shortcut...").clicked() {
+                                    action.assign_shortcut_id = Some(sound.id.clone());
+                                    ui.close_menu();
+                                }
+                                if sound.shortcut.is_some()
+                                    && ui.button("Clear Shortcut").clicked()
+                                {
+                                    action.clear_shortcut_id = Some(sound.id.clone());
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if ui.button("Remove Sound (-)").clicked() {
+                                    action.remove_sound_id = Some(sound.id.clone());
+                                    ui.close_menu();
+                                }
+                            });
+                        }
                     }
                 });
                 ui.add_space(spacing);
@@ -409,7 +429,9 @@ pub fn render_sound_grid(
         });
 
     // Finalize drag ghost preview or drop-to-reorder (requiring > 6.0 px movement)
-    if primary_down {
+    if !grid_enabled {
+        ui.data_mut(|d| d.remove::<PadDragState>(drag_key));
+    } else if primary_down {
         if let (Some(pos), Some(src_idx)) = (pointer_pos, dragging_src_idx) {
             let ghost_painter = ui
                 .ctx()

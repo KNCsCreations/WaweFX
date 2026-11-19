@@ -354,6 +354,15 @@ pub fn render_modals(
     outcome
 }
 
+fn keep_modal_on_top(
+    ctx: &egui::Context,
+    win_resp: Option<egui::InnerResponse<Option<()>>>,
+) {
+    if let Some(resp) = win_resp {
+        ctx.move_to_top(resp.response.layer_id);
+    }
+}
+
 fn render_sound_editor_modal(
     ctx: &egui::Context,
     draft: &mut SoundModalDraft,
@@ -367,7 +376,7 @@ fn render_sound_editor_modal(
     };
 
     let mut open = true;
-    egui::Window::new(title)
+    let win_resp = egui::Window::new(title)
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -528,6 +537,7 @@ fn render_sound_editor_modal(
                 });
             });
         });
+    keep_modal_on_top(ctx, win_resp);
 
     if !open {
         outcome.close_modal = true;
@@ -652,7 +662,7 @@ fn render_settings_modal(
     outcome: &mut ModalOutcome,
 ) {
     let mut open = true;
-    egui::Window::new("WaweFX Settings")
+    let win_resp = egui::Window::new("WaweFX Settings")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -1133,6 +1143,7 @@ fn render_settings_modal(
                 });
             });
         });
+    keep_modal_on_top(ctx, win_resp);
 
     if !open {
         outcome.close_modal = true;
@@ -1186,7 +1197,7 @@ fn render_alerts_modal(
     let has_any_warning = !status.warnings.is_empty()
         || !hotkey_status.warnings.is_empty()
         || missing_virtual_driver;
-    egui::Window::new("Audio Engine Status & Alerts")
+    let win_resp = egui::Window::new("Audio Engine Status & Alerts")
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -1300,6 +1311,7 @@ fn render_alerts_modal(
                 });
             });
         });
+    keep_modal_on_top(ctx, win_resp);
 
     if !open {
         outcome.close_modal = true;
@@ -1420,7 +1432,7 @@ fn render_companion_modal(
         format!("http://{local_ip}:{sync_port}/")
     };
 
-    egui::Window::new("Android / Mobile Companion Sync")
+    let win_resp = egui::Window::new("Android / Mobile Companion Sync")
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
@@ -1470,6 +1482,7 @@ fn render_companion_modal(
                 }
             });
         });
+    keep_modal_on_top(ctx, win_resp);
 
     if !open {
         outcome.close_modal = true;
