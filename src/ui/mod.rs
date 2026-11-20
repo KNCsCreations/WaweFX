@@ -1123,6 +1123,18 @@ impl WaweFxApp {
                     }
                 };
 
+                #[cfg(target_os = "macos")]
+                let resolved_drop_pos = {
+                    let os_pos = macos_live_cursor_in_window(ctx);
+                    let latest_pos = ctx.input(|i| i.pointer.latest_pos());
+                    let inner_rect = ctx.input(|i| i.viewport().inner_rect);
+                    eprintln!(
+                        "[macOS D&D] os_pos={os_pos:?} latest_pos={latest_pos:?} inner_rect={inner_rect:?} pad_count={}",
+                        pad_rects.len()
+                    );
+                    os_pos.or(drop_pos).or(latest_pos)
+                };
+                #[cfg(not(target_os = "macos"))]
                 let resolved_drop_pos = drop_pos.or_else(|| resolve_file_drop_pointer_pos(ctx, true));
                 let target_pad_id = find_drop_target_pad(
                     resolved_drop_pos,
@@ -1233,27 +1245,24 @@ fn resolve_file_drop_pointer_pos(
     ctx: &egui::Context,
     active_file_drag: bool,
 ) -> Option<egui::Pos2> {
-    let egui_pos = ctx.input(|i| {
+    if active_file_drag {
+        #[cfg(target_os = "macos")]
+        if let Some(mac_pos) = macos_live_cursor_in_window(ctx) {
+            return Some(mac_pos);
+        }
+
+        #[cfg(target_os = "windows")]
+        if let Some(win_pos) = windows_live_cursor_in_window(ctx) {
+            return Some(win_pos);
+        }
+    }
+
+    ctx.input(|i| {
         i.pointer
             .latest_pos()
             .or_else(|| i.pointer.interact_pos())
             .or_else(|| i.pointer.hover_pos())
-    });
-    if !active_file_drag {
-        return egui_pos;
-    }
-
-    #[cfg(target_os = "windows")]
-    if let Some(win_pos) = windows_live_cursor_in_window(ctx) {
-        return Some(win_pos);
-    }
-
-    #[cfg(target_os = "macos")]
-    if let Some(mac_pos) = macos_live_cursor_in_window(ctx) {
-        return Some(mac_pos);
-    }
-
-    egui_pos
+    })
 }
 
 #[cfg(target_os = "macos")]
