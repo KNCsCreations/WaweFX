@@ -833,6 +833,7 @@ impl eframe::App for WaweFxApp {
             ctx.request_repaint();
         }
         if !hovered_files.is_empty() {
+            ctx.request_repaint();
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.audio.is_playing() {
             ctx.request_repaint_after(Duration::from_millis(33));
@@ -1122,8 +1123,9 @@ impl WaweFxApp {
                     }
                 };
 
+                let resolved_drop_pos = drop_pos.or_else(|| resolve_file_drop_pointer_pos(ctx, true));
                 let target_pad_id = find_drop_target_pad(
-                    drop_pos,
+                    resolved_drop_pos,
                     pad_rects,
                     self.last_hovered_image_pad_id.as_deref(),
                 )
@@ -1246,7 +1248,90 @@ fn resolve_file_drop_pointer_pos(
         return Some(win_pos);
     }
 
+    #[cfg(target_os = "macos")]
+    if let Some(mac_pos) = macos_live_cursor_in_window(ctx) {
+        return Some(mac_pos);
+    }
+
     egui_pos
+}
+
+#[cfg(target_os = "macos")]
+fn macos_live_cursor_in_window(ctx: &egui::Context) -> Option<egui::Pos2> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreate(source: *const c_void) -> *const c_void;
+        fn CGEventGetLocation(event: *const c_void) -> CGPoint;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+
+    let inner_rect = ctx.input(|i| i.viewport().inner_rect)?;
+    // SAFETY: `CGEventCreate(null)` allocates an immutable snapshot event containing the live
+    // hardware cursor position; when non-null we read its location immediately and release it.
+    let pt = unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            return None;
+        }
+        let loc = CGEventGetLocation(event);
+        CFRelease(event);
+        loc
+    };
+    let ppp = ctx.pixels_per_point().max(0.1);
+    let native_scale = ctx
+        .input(|i| i.viewport().native_pixels_per_point)
+        .unwrap_or(ppp)
+        .max(0.1);
+    let zoom_adjust = (native_scale / ppp) as f64;
+    macos_screen_to_window_local(
+        (pt.x * zoom_adjust, pt.y * zoom_adjust),
+        inner_rect,
+        ctx.screen_rect(),
+        ppp,
+    )
+}
+
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn macos_screen_to_window_local(
+    cursor_screen_pts: (f64, f64),
+    inner_rect: egui::Rect,
+    screen_rect: egui::Rect,
+    ppp: f32,
+) -> Option<egui::Pos2> {
+    let bounds = screen_rect.expand(6.0);
+    let local_pts = egui::pos2(
+        cursor_screen_pts.0 as f32 - inner_rect.min.x,
+        cursor_screen_pts.1 as f32 - inner_rect.min.y,
+    );
+    if bounds.contains(local_pts) {
+        return Some(local_pts);
+    }
+
+    let safe_ppp = ppp.max(0.1);
+    if (safe_ppp - 1.0).abs() > f32::EPSILON {
+        let local_phys = egui::pos2(
+            cursor_screen_pts.0 as f32 / safe_ppp - inner_rect.min.x,
+            cursor_screen_pts.1 as f32 / safe_ppp - inner_rect.min.y,
+        );
+        if bounds.contains(local_phys) {
+            return Some(local_phys);
+        }
+    }
+
+    None
 }
 
 #[cfg(target_os = "windows")]
@@ -1394,7 +1479,7 @@ mod tests {
 
     use super::{
         LOGO_PNG_BYTES, build_window_icon, decode_thumbnail_bytes, decode_thumbnail_image,
-        find_drop_target_pad, is_image_file,
+        find_drop_target_pad, is_image_file, macos_screen_to_window_local,
     };
 
     #[test]
@@ -1482,6 +1567,50 @@ mod tests {
         );
         assert_eq!(
             find_drop_target_pad(None, &rects, Some("scrolled-off-pad")),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_screen_to_window_local_handles_logical_retina_and_out_of_bounds() {
+        let inner_rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(200.0, 120.0),
+            eframe::egui::vec2(800.0, 600.0),
+        );
+        let screen_rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(0.0, 0.0),
+            eframe::egui::vec2(800.0, 600.0),
+        );
+        let pad_rect = eframe::egui::Rect::from_min_max(
+            eframe::egui::pos2(124.0, 100.0),
+            eframe::egui::pos2(224.0, 230.0),
+        );
+        let rects = vec![("pad-2".to_string(), pad_rect)];
+
+        // Standard CoreGraphics Quartz global points -> exact window-local coordinate hitting pad-2
+        let local = macos_screen_to_window_local((360.0, 270.0), inner_rect, screen_rect, 2.0)
+            .expect("logical cursor should map inside window");
+        assert_eq!(local, eframe::egui::pos2(160.0, 150.0));
+        assert_eq!(
+            find_drop_target_pad(Some(local), &rects, None).as_deref(),
+            Some("pad-2")
+        );
+
+        // Edge within 6 px tolerance inside window bounds
+        assert_eq!(
+            macos_screen_to_window_local((196.0, 120.0), inner_rect, screen_rect, 1.0),
+            Some(eframe::egui::pos2(-4.0, 0.0))
+        );
+
+        // Physical pixel fallback when a Retina physical cursor exceeds logical bounds
+        let phys_local =
+            macos_screen_to_window_local((1120.0, 1080.0), inner_rect, screen_rect, 2.0)
+                .expect("retina physical cursor should fall back to window-local");
+        assert_eq!(phys_local, eframe::egui::pos2(360.0, 420.0));
+
+        // Cursor far outside the window rejects instead of returning a bogus coordinate
+        assert_eq!(
+            macos_screen_to_window_local((2500.0, 1600.0), inner_rect, screen_rect, 2.0),
             None
         );
     }
