@@ -73,6 +73,7 @@ jobs:
           chmod +x WaweFX.app/Contents/MacOS/WaweFX
           cp macos/Info.plist WaweFX.app/Contents/Info.plist
           plutil -replace CFBundleIconFile -string AppIcon WaweFX.app/Contents/Info.plist
+          grep -q "<string>AppIcon</string>" WaweFX.app/Contents/Info.plist
           printf "APPL????" > WaweFX.app/Contents/PkgInfo
           rm -rf AppIcon.iconset
           if ! cargo test ui::tests::generate_macos_iconset_files -- --ignored --exact; then
@@ -92,6 +93,7 @@ jobs:
           test -s WaweFX.app/Contents/Resources/AppIcon.icns
           rm -rf AppIcon.iconset
           codesign --force --deep --sign - WaweFX.app
+          codesign --verify --deep --strict WaweFX.app
           rm -rf dmg_root
           mkdir -p dmg_root
           mv WaweFX.app dmg_root/

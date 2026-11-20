@@ -604,6 +604,7 @@ impl StreamTrackState {
             for entry in guard.iter() {
                 if entry.instance_id > self.local_last_instance_id {
                     let (start_frame, end_frame) = entry.sound.effective_frame_bounds();
+                    self.local_tracks.retain(|t| t.sound.id != entry.sound.id);
                     self.local_tracks.push(LocalMixerTrack {
                         instance_id: entry.instance_id,
                         sound: Arc::clone(&entry.sound),
@@ -859,9 +860,12 @@ impl AudioBackend for SoftwareMixerBackend {
             if !allow_overlap {
                 guard.clear();
                 self.shared.stop_epoch.fetch_add(1, Ordering::AcqRel);
-            } else if guard.len() >= 32 {
-                let excess = guard.len() - 31;
-                guard.drain(..excess);
+            } else {
+                guard.retain(|q| q.sound.id != sound_id);
+                if guard.len() >= 32 {
+                    let excess = guard.len() - 31;
+                    guard.drain(..excess);
+                }
             }
             let instance_id = self.shared.next_instance_id.fetch_add(1, Ordering::AcqRel);
             guard.push(QueuedTrack { instance_id, sound });
@@ -1960,6 +1964,29 @@ mod tests {
         assert!((mix_l - 0.5).abs() < 1e-5, "expected 0.2 + 0.3 = 0.5, got {mix_l}");
         assert!((mix_r - 0.5).abs() < 1e-5, "expected 0.2 + 0.3 = 0.5, got {mix_r}");
         assert_eq!(shared.mic_ring.len_frames(), 32);
+
+        // Re-triggering the same sound (with trim_start_frame = 2) in Overlap ON restarts it
+        // cleanly without self-overlapping, while keeping other active sounds playing.
+        let sound_a_trimmed = Arc::new(ActiveSoundData {
+            id: "a".to_string(),
+            title: "Sound A".to_string(),
+            samples: Arc::new(vec![0.2f32; 20]),
+            frame_count: 10,
+            trim_start_frame: 2,
+            trim_end_frame: 10,
+            volume_trim: 1.0,
+        });
+        backend.play_sound(sound_a_trimmed);
+        stream_state.sync_from_shared(shared);
+        assert_eq!(
+            stream_state.local_tracks.len(),
+            2,
+            "re-triggering Sound A should replace its active voice rather than stacking"
+        );
+        assert_eq!(stream_state.local_tracks[0].sound.id, "b");
+        assert!((stream_state.local_tracks[0].pos_frames - 1.0).abs() < 1e-5);
+        assert_eq!(stream_state.local_tracks[1].sound.id, "a");
+        assert!((stream_state.local_tracks[1].pos_frames - 2.0).abs() < 1e-5);
 
         // Overlap OFF: playing A again clears previously active tracks so only A plays.
         backend.set_allow_overlap(false);
