@@ -10,12 +10,10 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use image::ImageReader;
-#[cfg(any(not(target_os = "macos"), test))]
 use image::imageops::FilterType;
 use uuid::Uuid;
 
 /// Embedded WaweFX brand logo PNG bytes compiled directly into the standalone binary.
-#[cfg(any(not(target_os = "macos"), test))]
 pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../assets/logo.png");
 
 use crate::audio::{AudioDeviceList, AudioEngine, PREVIEW_SOUND_ID};
@@ -164,9 +162,15 @@ fn decode_thumbnail_image(path: &Path) -> Option<ColorImage> {
     Some(ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()))
 }
 
+fn decode_thumbnail_bytes(bytes: &[u8]) -> Option<ColorImage> {
+    let decoded = image::load_from_memory(bytes).ok()?;
+    let thumb = decoded.thumbnail(256, 256).to_rgba8();
+    let size = [thumb.width() as usize, thumb.height() as usize];
+    Some(ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()))
+}
+
 /// Decodes the embedded `assets/logo.png` into a 256x256 RGBA [`egui::IconData`] for the
-/// application window titlebar and Windows Taskbar.
-#[cfg(any(not(target_os = "macos"), test))]
+/// application window titlebar, Windows Taskbar, and non-bundled macOS runs.
 pub fn build_window_icon() -> egui::IconData {
     if let Ok(decoded) = image::load_from_memory(LOGO_PNG_BYTES) {
         let resized = decoded
@@ -188,6 +192,12 @@ pub fn build_window_icon() -> egui::IconData {
     }
 }
 
+struct PendingCoverDrop {
+    managed_cover: PathBuf,
+    color_img: ColorImage,
+    preview_texture: Option<TextureHandle>,
+}
+
 /// Root eframe application state for WaweFX.
 pub struct WaweFxApp {
     pub config: AppConfig,
@@ -202,6 +212,8 @@ pub struct WaweFxApp {
     pub local_ip: String,
     pub last_error: Option<String>,
     last_hovered_image_pad_id: Option<String>,
+    last_valid_pointer_pos: Option<egui::Pos2>,
+    pending_cover_drop: Option<PendingCoverDrop>,
     status_toast: Option<(String, Instant)>,
     last_playback_state: (bool, Option<String>),
 }
@@ -234,6 +246,8 @@ impl WaweFxApp {
             local_ip,
             last_error: None,
             last_hovered_image_pad_id: None,
+            last_valid_pointer_pos: None,
+            pending_cover_drop: None,
             status_toast: None,
             last_playback_state,
         }
@@ -394,6 +408,11 @@ impl eframe::App for WaweFxApp {
             ctx.input(|i| (i.raw.hovered_files.clone(), i.raw.dropped_files.clone()));
         let active_file_drag = !hovered_files.is_empty() || !dropped_files.is_empty();
         let drop_pointer_pos = resolve_file_drop_pointer_pos(ctx, active_file_drag);
+        if let Some(pos) = drop_pointer_pos
+            && ctx.screen_rect().contains(pos)
+        {
+            self.last_valid_pointer_pos = Some(pos);
+        }
 
         let mut config_dirty = false;
         let mut sync_dirty = false;
@@ -477,7 +496,7 @@ impl eframe::App for WaweFxApp {
             || !self.hotkeys.status().warnings.is_empty();
         let bg_toolbar = rgb_to_color32(self.config.theme.bg_toolbar);
         let bg_main = rgb_to_color32(self.config.theme.bg_main);
-        let is_any_modal_open = self.active_modal.is_some();
+        let is_any_modal_open = self.active_modal.is_some() || self.pending_cover_drop.is_some();
 
         // Top Pixel-Accurate Toolbar
         let available_update = self.updater.available_update();
@@ -565,13 +584,15 @@ impl eframe::App for WaweFxApp {
         }
 
         let accent = rgb_to_color32(self.config.theme.accent_color);
-        let hovered_image_drop = !is_any_modal_open
-            && hovered_files.iter().any(|f| {
-                f.path.as_deref().is_some_and(is_image_file) || f.mime.starts_with("image/")
-            });
         let hovered_audio_drop = !is_any_modal_open
             && hovered_files.iter().any(|f| {
                 f.path.as_deref().is_some_and(is_audio_file) || f.mime.starts_with("audio/")
+            });
+        let hovered_image_drop = !is_any_modal_open
+            && hovered_files.iter().any(|f| {
+                f.path.as_deref().is_some_and(is_image_file)
+                    || f.mime.starts_with("image/")
+                    || (f.path.is_none() && f.mime.is_empty())
             });
 
         // Main Soundboard Canvas / Grid (never shifts layout during external file drag-hover)
@@ -650,14 +671,14 @@ impl eframe::App for WaweFxApp {
                 {
                     format!("Release to set cover on '{}'", pad.title)
                 } else {
-                    "Drop image onto a Sound Pad card to set its cover".to_string()
+                    "Drop image onto a sound pad (or open Edit Sound first)".to_string()
                 }
             } else if hovered_audio_drop && !hovered_image_drop {
                 "Drop audio file anywhere to add a new Sound Pad".to_string()
             } else {
-                "Drop audio files to add pads, or drop an image onto a pad card".to_string()
+                "Drop image onto a sound pad (or open Edit Sound first)".to_string()
             };
-            paint_floating_hint_pill(
+            paint_top_drop_banner(
                 ctx,
                 central_rect,
                 &hint,
@@ -709,11 +730,17 @@ impl eframe::App for WaweFxApp {
             sync_dirty = true;
         }
 
-        // Render dimmed backdrop & active modal window
-        if self.active_modal.is_some() {
+        // Render dimmed backdrop & active modal window (or pending dropped-cover target picker)
+        if self.active_modal.is_some() || self.pending_cover_drop.is_some() {
             render_modal_backdrop(ctx);
         }
         if let Some(mut modal) = self.active_modal.take() {
+            if let ActiveModal::SoundEditor(ref mut draft) = modal
+                && !dropped_files.is_empty()
+            {
+                self.handle_dropped_files_in_modal(draft, &dropped_files);
+            }
+
             let bound_port = self.sync.bound_port();
             let connected_clients = self.sync.connected_clients();
             let mut modal_cfg = self.config.clone();
@@ -775,6 +802,11 @@ impl eframe::App for WaweFxApp {
                 }
                 ctx.request_repaint();
             }
+        } else if self.pending_cover_drop.is_some()
+            && self.render_pending_cover_drop_picker(ctx, &grid_action.pad_rects)
+        {
+            config_dirty = true;
+            sync_dirty = true;
         }
 
         if config_dirty {
@@ -815,6 +847,227 @@ impl eframe::App for WaweFxApp {
 }
 
 impl WaweFxApp {
+    fn apply_cover_to_pad(
+        &mut self,
+        ctx: &egui::Context,
+        pad_id: &str,
+        managed_cover: PathBuf,
+        color_img: ColorImage,
+    ) -> bool {
+        let resolved_managed = AppConfig::resolve_asset_path(&managed_cover);
+        let mut pad_title = String::new();
+        let mut applied = false;
+        let old_img = if let Some(sound) = self.config.sounds.iter_mut().find(|s| s.id == pad_id) {
+            applied = true;
+            pad_title = sound.title.clone();
+            let prev = sound.image_path.replace(managed_cover.clone());
+            if prev.as_ref() == Some(&managed_cover) {
+                None
+            } else {
+                prev
+            }
+        } else {
+            None
+        };
+        if !applied {
+            self.config.cleanup_managed_path(&managed_cover);
+            return false;
+        }
+        if let Some(prev_path) = old_img {
+            self.config.cleanup_managed_path(&prev_path);
+        }
+        self.thumbnails
+            .set_decoded(ctx, pad_id, resolved_managed, color_img);
+        self.sync.invalidate_thumbnail(pad_id);
+        self.last_error = None;
+        self.status_toast = Some((format!("Updated cover for '{}'", pad_title), Instant::now()));
+        true
+    }
+
+    fn handle_dropped_files_in_modal(
+        &mut self,
+        draft: &mut SoundModalDraft,
+        dropped_files: &[egui::DroppedFile],
+    ) {
+        for dropped in dropped_files {
+            if is_dropped_image(dropped) {
+                if let Some(ref path) = dropped.path
+                    && dropped.bytes.is_none()
+                    && decode_thumbnail_image(path).is_some()
+                {
+                    draft.image_path = Some(path.clone());
+                    draft.error_message = None;
+                    self.status_toast =
+                        Some(("Assigned dropped cover image".to_string(), Instant::now()));
+                    return;
+                }
+                match import_and_decode_dropped_cover(dropped) {
+                    Ok((managed_cover, _)) => {
+                        draft.image_path = Some(managed_cover);
+                        draft.error_message = None;
+                        self.status_toast =
+                            Some(("Assigned dropped cover image".to_string(), Instant::now()));
+                        return;
+                    }
+                    Err(err) => {
+                        draft.error_message = Some(err);
+                    }
+                }
+            } else if let Some(ref path) = dropped.path
+                && is_audio_file(path)
+            {
+                if draft.title.trim().is_empty()
+                    && let Some(stem) = path.file_stem()
+                {
+                    draft.title = stem.to_string_lossy().to_string();
+                }
+                match self.audio.probe_audio_with_peaks(path) {
+                    Ok((secs, peaks)) => {
+                        draft.duration_secs = secs;
+                        draft.trim_start = 0.0;
+                        draft.trim_end = 1.0;
+                        draft.waveform_peaks = Some(peaks);
+                        draft.waveform_loaded_for = Some(path.clone());
+                        draft.audio_path = Some(path.clone());
+                        draft.error_message = None;
+                    }
+                    Err(err) => {
+                        draft.error_message = Some(format!("Could not decode audio: {err}"));
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    fn render_pending_cover_drop_picker(
+        &mut self,
+        ctx: &egui::Context,
+        pad_rects: &[(String, egui::Rect)],
+    ) -> bool {
+        let Some(mut pending) = self.pending_cover_drop.take() else {
+            return false;
+        };
+
+        let tex = pending.preview_texture.get_or_insert_with(|| {
+            ctx.load_texture(
+                "wawefx_pending_cover_drop_preview",
+                pending.color_img.clone(),
+                TextureOptions::LINEAR,
+            )
+        });
+        let tex_id = tex.id();
+
+        let suggested_pad_id =
+            find_drop_target_pad(self.last_valid_pointer_pos, pad_rects, None)
+                .or_else(|| self.config.selected_sound_id.clone());
+
+        let mut chosen_pad_id: Option<String> = None;
+        let mut cancel = false;
+        let mut open = true;
+        let theme = &self.config.theme;
+        let bg_fill = rgb_to_color32(theme.bg_toolbar);
+        let stroke_col = rgb_to_color32(theme.toolbar_divider);
+        let accent = rgb_to_color32(theme.accent_color);
+
+        let win_resp = egui::Window::new("Select target pad for dropped cover image")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(bg_fill)
+                    .stroke(egui::Stroke::new(1.0_f32, stroke_col))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Image::new((tex_id, egui::vec2(56.0, 56.0))).corner_radius(6.0));
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Choose which Sound Pad gets this cover image:")
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Tip: You can also drop directly into Edit Sound Properties.",
+                            )
+                            .weak()
+                            .size(11.0),
+                        );
+                    });
+                });
+                ui.add_space(10.0);
+
+                if let Some(ref sug_id) = suggested_pad_id
+                    && let Some(sug_pad) = self.config.sounds.iter().find(|s| s.id == *sug_id)
+                {
+                    let btn_label = format!("Set on Selected/Last Pad: {}", sug_pad.title);
+                    let fg = {
+                        let luma = 0.299 * accent.r() as f32
+                            + 0.587 * accent.g() as f32
+                            + 0.114 * accent.b() as f32;
+                        if luma > 175.0 {
+                            egui::Color32::from_rgb(0x2B, 0x25, 0x20)
+                        } else {
+                            egui::Color32::WHITE
+                        }
+                    };
+                    if ui
+                        .add_sized(
+                            egui::vec2(328.0, 28.0),
+                            egui::Button::new(egui::RichText::new(btn_label).strong().color(fg))
+                                .fill(accent),
+                        )
+                        .clicked()
+                    {
+                        chosen_pad_id = Some(sug_pad.id.clone());
+                    }
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                }
+
+                egui::ScrollArea::vertical()
+                    .max_height(210.0)
+                    .show(ui, |ui| {
+                        for sound in &self.config.sounds {
+                            if ui
+                                .add_sized(egui::vec2(328.0, 26.0), egui::Button::new(&sound.title))
+                                .clicked()
+                            {
+                                chosen_pad_id = Some(sound.id.clone());
+                            }
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if let Some(resp) = win_resp {
+            ctx.move_to_top(resp.response.layer_id);
+        }
+
+        if let Some(pad_id) = chosen_pad_id {
+            return self.apply_cover_to_pad(ctx, &pad_id, pending.managed_cover, pending.color_img);
+        }
+        if !open || cancel {
+            self.config.cleanup_managed_path(&pending.managed_cover);
+            return false;
+        }
+        self.pending_cover_drop = Some(pending);
+        false
+    }
+
     /// Processes external audio/image files dropped onto the application window.
     fn handle_dropped_files(
         &mut self,
@@ -826,13 +1079,10 @@ impl WaweFxApp {
         let mut changed = false;
 
         for dropped in dropped_files {
-            let Some(path) = dropped.path.clone() else {
-                self.last_error = Some("Dropped item does not provide a local file path.".to_string());
-                continue;
-            };
-
-            if is_audio_file(&path) {
-                match AudioEngine::probe_audio_duration(&path) {
+            if let Some(ref path) = dropped.path
+                && is_audio_file(path)
+            {
+                match AudioEngine::probe_audio_duration(path) {
                     Ok(duration_secs) => {
                         let title = path
                             .file_stem()
@@ -840,7 +1090,7 @@ impl WaweFxApp {
                             .filter(|s| !s.trim().is_empty())
                             .unwrap_or("New Sound")
                             .to_string();
-                        match AppConfig::import_sound_file(&path) {
+                        match AppConfig::import_sound_file(path) {
                             Ok(managed_audio) => {
                                 let item = SoundItem::new(title, managed_audio, None, duration_secs);
                                 self.config.selected_sound_id = Some(item.id.clone());
@@ -863,76 +1113,100 @@ impl WaweFxApp {
                         ));
                     }
                 }
-            } else if is_image_file(&path) {
+            } else if is_dropped_image(dropped) {
+                let (managed_cover, color_img) = match import_and_decode_dropped_cover(dropped) {
+                    Ok(res) => res,
+                    Err(err) => {
+                        self.last_error = Some(err);
+                        continue;
+                    }
+                };
+
                 let target_pad_id = find_drop_target_pad(
                     drop_pos,
                     pad_rects,
                     self.last_hovered_image_pad_id.as_deref(),
-                );
+                )
+                .or_else(|| {
+                    (self.config.sounds.len() == 1).then(|| self.config.sounds[0].id.clone())
+                });
 
                 if let Some(pad_id) = target_pad_id {
-                    let Some(color_img) = decode_thumbnail_image(&path) else {
-                        self.last_error = Some(format!(
-                            "Could not decode dropped image '{}'.",
-                            path.display()
-                        ));
-                        continue;
-                    };
-
-                    match AppConfig::import_cover_file(&path) {
-                        Ok(managed_cover) => {
-                            let resolved_managed = AppConfig::resolve_asset_path(&managed_cover);
-                            let mut pad_title = String::new();
-                            let old_img = if let Some(sound) =
-                                self.config.sounds.iter_mut().find(|s| s.id == pad_id)
-                            {
-                                pad_title = sound.title.clone();
-                                let prev = sound.image_path.replace(managed_cover.clone());
-                                if prev.as_ref() == Some(&managed_cover) {
-                                    None
-                                } else {
-                                    prev
-                                }
-                            } else {
-                                None
-                            };
-                            if let Some(prev_path) = old_img {
-                                self.config.cleanup_managed_path(&prev_path);
-                            }
-                            self.thumbnails
-                                .set_decoded(ctx, &pad_id, resolved_managed, color_img);
-                            self.sync.invalidate_thumbnail(&pad_id);
-                            self.last_error = None;
-                            self.status_toast = Some((
-                                format!("Updated cover for '{}'", pad_title),
-                                Instant::now(),
-                            ));
-                            changed = true;
-                        }
-                        Err(err) => {
-                            self.last_error = Some(format!(
-                                "Failed to copy dropped cover '{}' into WaweFX data folder: {err:#}",
-                                path.display()
-                            ));
-                        }
+                    if self.apply_cover_to_pad(ctx, &pad_id, managed_cover, color_img) {
+                        changed = true;
                     }
-                } else {
+                } else if self.config.sounds.is_empty() {
+                    self.config.cleanup_managed_path(&managed_cover);
                     self.status_toast = Some((
-                        "Drop an image directly onto a Sound Pad card to set its cover."
-                            .to_string(),
+                        "Add a sound pad first, then drop a cover image onto it.".to_string(),
                         Instant::now(),
                     ));
+                } else {
+                    if let Some(prev_pending) = self.pending_cover_drop.take() {
+                        self.config.cleanup_managed_path(&prev_pending.managed_cover);
+                    }
+                    self.last_error = None;
+                    self.pending_cover_drop = Some(PendingCoverDrop {
+                        managed_cover,
+                        color_img,
+                        preview_texture: None,
+                    });
                 }
-            } else {
+            } else if let Some(ref path) = dropped.path {
                 self.last_error = Some(format!(
                     "Unsupported file type '{}'. Supported: mp3, wav, ogg, flac, png, jpg, jpeg, webp, bmp.",
                     path.display()
                 ));
+            } else {
+                self.last_error =
+                    Some("Dropped item is not a supported audio or image format.".to_string());
             }
         }
 
         changed
     }
+}
+
+fn is_dropped_image(dropped: &egui::DroppedFile) -> bool {
+    dropped.path.as_deref().is_some_and(is_image_file)
+        || dropped.mime.starts_with("image/")
+        || dropped
+            .bytes
+            .as_deref()
+            .is_some_and(|b| image::guess_format(b).is_ok())
+}
+
+fn import_and_decode_dropped_cover(
+    dropped: &egui::DroppedFile,
+) -> Result<(PathBuf, ColorImage), String> {
+    if let Some(bytes) = dropped.bytes.as_deref() {
+        let color_img = decode_thumbnail_bytes(bytes)
+            .ok_or_else(|| "Could not decode dropped image bytes.".to_string())?;
+        let hint = dropped
+            .path
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .or_else(|| (!dropped.name.trim().is_empty()).then_some(dropped.name.as_str()));
+        let managed_cover = AppConfig::import_cover_bytes(bytes, hint).map_err(|err| {
+            format!("Failed to save dropped cover into WaweFX data folder: {err:#}")
+        })?;
+        return Ok((managed_cover, color_img));
+    }
+
+    if let Some(ref path) = dropped.path {
+        let color_img = decode_thumbnail_image(path)
+            .ok_or_else(|| format!("Could not decode dropped image '{}'.", path.display()))?;
+        let managed_cover = AppConfig::import_cover_file(path).map_err(|err| {
+            format!(
+                "Failed to copy dropped cover '{}' into WaweFX data folder: {err:#}",
+                path.display()
+            )
+        })?;
+        return Ok((managed_cover, color_img));
+    }
+
+    Err("Dropped image does not contain a file path or raw bytes.".to_string())
 }
 
 fn render_modal_backdrop(ctx: &egui::Context) {
@@ -1012,7 +1286,7 @@ fn find_drop_target_pad(
         }
         return pad_rects
             .iter()
-            .filter(|(_, rect)| rect.expand(4.0).contains(pos))
+            .filter(|(_, rect)| rect.expand(6.0).contains(pos))
             .min_by(|(_, a), (_, b)| {
                 a.center()
                     .distance_sq(pos)
@@ -1029,6 +1303,18 @@ fn find_drop_target_pad(
     })
 }
 
+fn paint_top_drop_banner(
+    ctx: &egui::Context,
+    canvas_rect: egui::Rect,
+    text: &str,
+    accent: egui::Color32,
+    surface: egui::Color32,
+    text_color: egui::Color32,
+) {
+    let center_y = (canvas_rect.min.y + 22.0).min(canvas_rect.max.y - 18.0);
+    paint_pill_at_y(ctx, canvas_rect, center_y, "wawefx_drop_top_banner", text, accent, surface, text_color);
+}
+
 fn paint_floating_hint_pill(
     ctx: &egui::Context,
     canvas_rect: egui::Rect,
@@ -1037,19 +1323,31 @@ fn paint_floating_hint_pill(
     surface: egui::Color32,
     text_color: egui::Color32,
 ) {
+    let center_y = (canvas_rect.max.y - 24.0).max(canvas_rect.min.y + 20.0);
+    paint_pill_at_y(ctx, canvas_rect, center_y, "wawefx_drop_hint_pill", text, accent, surface, text_color);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_pill_at_y(
+    ctx: &egui::Context,
+    canvas_rect: egui::Rect,
+    center_y: f32,
+    id_salt: &str,
+    text: &str,
+    accent: egui::Color32,
+    surface: egui::Color32,
+    text_color: egui::Color32,
+) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
-        egui::Id::new("wawefx_drop_hint_pill"),
+        egui::Id::new(id_salt),
     ));
     let font = egui::FontId::proportional(12.5);
     let galley = painter.layout_no_wrap(text.to_string(), font, text_color);
     let max_w = (canvas_rect.width() - 32.0).max(160.0);
     let pill_w = (galley.size().x + 28.0).clamp(140.0, max_w);
     let pill_h = 30.0;
-    let center = egui::pos2(
-        canvas_rect.center().x,
-        (canvas_rect.max.y - 24.0).max(canvas_rect.min.y + 20.0),
-    );
+    let center = egui::pos2(canvas_rect.center().x, center_y);
     let pill_rect = egui::Rect::from_center_size(center, egui::vec2(pill_w, pill_h));
     let bg = egui::Color32::from_rgba_unmultiplied(surface.r(), surface.g(), surface.b(), 238);
     painter.rect_filled(pill_rect, egui::CornerRadius::same(15), bg);
@@ -1095,8 +1393,8 @@ mod tests {
     use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, Rgba, RgbaImage};
 
     use super::{
-        LOGO_PNG_BYTES, build_window_icon, decode_thumbnail_image, find_drop_target_pad,
-        is_image_file,
+        LOGO_PNG_BYTES, build_window_icon, decode_thumbnail_bytes, decode_thumbnail_image,
+        find_drop_target_pad, is_image_file,
     };
 
     #[test]
@@ -1125,6 +1423,22 @@ mod tests {
     }
 
     #[test]
+    fn decodes_thumbnail_from_raw_image_bytes() {
+        let img = RgbaImage::from_pixel(512, 512, Rgba([220, 90, 40, 255]));
+        let mut png_bytes = Vec::new();
+        PngEncoder::new(&mut png_bytes)
+            .write_image(img.as_raw(), 512, 512, ExtendedColorType::Rgba8)
+            .expect("encode png bytes");
+        let decoded = decode_thumbnail_bytes(&png_bytes).expect("bytes should decode");
+        assert_eq!(decoded.size, [256, 256]);
+        assert_eq!(
+            decoded.pixels[0],
+            eframe::egui::Color32::from_rgba_unmultiplied(220, 90, 40, 255)
+        );
+        assert!(decode_thumbnail_bytes(b"invalid image data").is_none());
+    }
+
+    #[test]
     fn find_drop_target_pad_handles_exact_tolerance_outside_and_fallback() {
         let rects = vec![
             (
@@ -1147,9 +1461,9 @@ mod tests {
             find_drop_target_pad(Some(eframe::egui::pos2(50.0, 50.0)), &rects, None).as_deref(),
             Some("pad-1")
         );
-        // 3 px outside pad-2's left edge matches via 4 px tolerance
+        // 5 px outside pad-2's left edge matches via 6 px tolerance
         assert_eq!(
-            find_drop_target_pad(Some(eframe::egui::pos2(121.0, 50.0)), &rects, None).as_deref(),
+            find_drop_target_pad(Some(eframe::egui::pos2(119.0, 50.0)), &rects, None).as_deref(),
             Some("pad-2")
         );
         // Far outside any card returns None rather than falling back wrongly

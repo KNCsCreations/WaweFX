@@ -149,7 +149,7 @@ pub fn render_sound_grid(
                             && visible_rect.is_positive()
                             && action.hovered_image_pad_id.is_none()
                             && drop_pointer_pos
-                                .is_some_and(|p| visible_rect.expand(4.0).contains(p));
+                                .is_some_and(|p| visible_rect.expand(6.0).contains(p));
                         if is_image_drop_target {
                             action.hovered_image_pad_id = Some(sound.id.clone());
                         }

@@ -72,10 +72,24 @@ jobs:
             -output WaweFX.app/Contents/MacOS/WaweFX
           chmod +x WaweFX.app/Contents/MacOS/WaweFX
           cp macos/Info.plist WaweFX.app/Contents/Info.plist
+          plutil -replace CFBundleIconFile -string AppIcon WaweFX.app/Contents/Info.plist
           printf "APPL????" > WaweFX.app/Contents/PkgInfo
           rm -rf AppIcon.iconset
-          cargo test ui::tests::generate_macos_iconset_files -- --ignored --exact
-          iconutil -c icns AppIcon.iconset -o WaweFX.app/Contents/Resources/AppIcon.icns || cp assets/icon.icns WaweFX.app/Contents/Resources/AppIcon.icns
+          if ! cargo test ui::tests::generate_macos_iconset_files -- --ignored --exact; then
+            mkdir -p AppIcon.iconset
+            sips -z 16 16     assets/logo.png --out AppIcon.iconset/icon_16x16.png
+            sips -z 32 32     assets/logo.png --out AppIcon.iconset/icon_16x16@2x.png
+            sips -z 32 32     assets/logo.png --out AppIcon.iconset/icon_32x32.png
+            sips -z 64 64     assets/logo.png --out AppIcon.iconset/icon_32x32@2x.png
+            sips -z 128 128   assets/logo.png --out AppIcon.iconset/icon_128x128.png
+            sips -z 256 256   assets/logo.png --out AppIcon.iconset/icon_128x128@2x.png
+            sips -z 256 256   assets/logo.png --out AppIcon.iconset/icon_256x256.png
+            sips -z 512 512   assets/logo.png --out AppIcon.iconset/icon_256x256@2x.png
+            sips -z 512 512   assets/logo.png --out AppIcon.iconset/icon_512x512.png
+            sips -z 1024 1024 assets/logo.png --out AppIcon.iconset/icon_512x512@2x.png
+          fi
+          iconutil -c icns AppIcon.iconset -o WaweFX.app/Contents/Resources/AppIcon.icns
+          test -s WaweFX.app/Contents/Resources/AppIcon.icns
           rm -rf AppIcon.iconset
           codesign --force --deep --sign - WaweFX.app
           rm -rf dmg_root

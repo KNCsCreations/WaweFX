@@ -509,6 +509,61 @@ impl AppConfig {
         Self::import_asset_into_dir(&Self::data_dir(), COVERS_SUBDIR, source)
     }
 
+    /// Saves raw dropped cover image bytes into `<data_dir>/covers` and returns its relative path (`covers/<file>`).
+    pub fn import_cover_bytes(bytes: &[u8], hint_name: Option<&str>) -> anyhow::Result<PathBuf> {
+        Self::import_cover_bytes_into_dir(&Self::data_dir(), bytes, hint_name)
+    }
+
+    fn import_cover_bytes_into_dir(
+        base_dir: &Path,
+        bytes: &[u8],
+        hint_name: Option<&str>,
+    ) -> anyhow::Result<PathBuf> {
+        Self::ensure_data_dirs_in(base_dir)?;
+        let decoded = image::load_from_memory(bytes).context("dropped bytes are not a valid image")?;
+        let guessed_fmt = image::guess_format(bytes).ok();
+
+        let stem = hint_name
+            .and_then(|n| Path::new(n).file_stem())
+            .and_then(|s| s.to_str())
+            .map(sanitize_filename_stem)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "cover".to_string());
+        let short_id = &Uuid::new_v4().simple().to_string()[..8];
+
+        let (ext, encoded_bytes): (&str, Vec<u8>) = match guessed_fmt {
+            Some(image::ImageFormat::Png) => ("png", bytes.to_vec()),
+            Some(image::ImageFormat::Jpeg) => ("jpg", bytes.to_vec()),
+            Some(image::ImageFormat::WebP) => ("webp", bytes.to_vec()),
+            Some(image::ImageFormat::Bmp) => ("bmp", bytes.to_vec()),
+            _ => {
+                use image::ImageEncoder;
+                let rgba = decoded.to_rgba8();
+                let mut png_out = Vec::new();
+                image::codecs::png::PngEncoder::new(&mut png_out)
+                    .write_image(
+                        rgba.as_raw(),
+                        rgba.width(),
+                        rgba.height(),
+                        image::ExtendedColorType::Rgba8,
+                    )
+                    .context("failed to encode dropped image bytes as PNG")?;
+                ("png", png_out)
+            }
+        };
+
+        let file_name = format!("{stem}_{short_id}.{ext}");
+        let rel_path = PathBuf::from(COVERS_SUBDIR).join(&file_name);
+        let dest_path = base_dir.join(&rel_path);
+        fs::write(&dest_path, &encoded_bytes).with_context(|| {
+            format!(
+                "failed to write dropped cover bytes into '{}'",
+                dest_path.display()
+            )
+        })?;
+        Ok(rel_path)
+    }
+
     fn import_asset_into_dir(base_dir: &Path, subdir: &str, source: &Path) -> anyhow::Result<PathBuf> {
         Self::ensure_data_dirs_in(base_dir)?;
 
@@ -1249,6 +1304,28 @@ mod tests {
         let removed2 = cfg.sounds.remove(0);
         cfg.cleanup_managed_path_in(&app_dir, &removed2.audio_path);
         assert!(!managed_audio.exists(), "unreferenced audio must be deleted");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn imports_cover_bytes_into_managed_covers_dir() {
+        use image::{ExtendedColorType, ImageEncoder, Rgba, RgbaImage};
+
+        let root = std::env::temp_dir().join(format!("wawefx_cover_bytes_{}", Uuid::new_v4()));
+        let img = RgbaImage::from_pixel(16, 16, Rgba([12, 180, 240, 255]));
+        let mut png_bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png_bytes)
+            .write_image(img.as_raw(), 16, 16, ExtendedColorType::Rgba8)
+            .unwrap();
+
+        let rel = AppConfig::import_cover_bytes_into_dir(&root, &png_bytes, Some("browser-drop.png"))
+            .expect("import cover bytes");
+        assert!(rel.starts_with(COVERS_SUBDIR));
+        assert_eq!(rel.extension().and_then(|e| e.to_str()), Some("png"));
+        let full = AppConfig::resolve_asset_path_in(&root, &rel);
+        assert!(full.is_file());
+        assert!(AppConfig::import_cover_bytes_into_dir(&root, b"not an image", None).is_err());
 
         let _ = fs::remove_dir_all(&root);
     }
