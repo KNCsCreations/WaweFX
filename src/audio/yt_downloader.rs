@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc::{self, Receiver};
@@ -18,6 +18,7 @@ use crate::config::{AppConfig, SOUNDS_SUBDIR, sanitize_filename_stem};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const YT_DLP_TIMEOUT_SECS: u64 = 120;
+const FFMPEG_TIMEOUT_SECS: u64 = 300;
 
 /// Events emitted asynchronously from the background YouTube audio download worker.
 #[derive(Debug, Clone)]
@@ -173,9 +174,11 @@ fn download_youtube_audio_sync(
     let url = validate_youtube_url(raw_url)?;
     AppConfig::ensure_data_dirs().map_err(|err| format!("Failed to prepare storage: {err:#}"))?;
 
-    on_progress("Checking yt-dlp helper...".to_string());
+    if resolve_yt_dlp_binary().is_none() || resolve_ffmpeg_binary().is_none() {
+        on_progress("Downloading yt-dlp & ffmpeg (first-time setup)...".to_string());
+    }
     let yt_dlp = ensure_yt_dlp_binary(on_progress)?;
-    let ffmpeg = resolve_ffmpeg_binary();
+    let ffmpeg_bin = ensure_ffmpeg_binary(on_progress)?;
 
     let sounds_dir = AppConfig::sounds_dir();
     let stage_dir = sounds_dir.join(format!(".yt_tmp_{}", Uuid::new_v4().simple()));
@@ -189,35 +192,22 @@ fn download_youtube_audio_sync(
         .into_owned();
     let child_path = build_augmented_path(&AppConfig::bin_dir());
 
-    on_progress("Downloading & converting audio...".to_string());
+    on_progress("Downloading & converting audio to MP3...".to_string());
 
-    let downloaded_file = if let Some(ref ffmpeg_bin) = ffmpeg {
-        let out = run_yt_dlp_mp3(&yt_dlp, ffmpeg_bin, &output_template, &url, &child_path)?;
-        if out.status.success() {
-            find_first_file_in_dir(&stage_dir)?
-        } else {
-            let err_text = String::from_utf8_lossy(&out.stderr).to_ascii_lowercase();
-            if err_text.contains("ffmpeg") || err_text.contains("ffprobe") {
-                clear_dir_files(&stage_dir);
-                run_yt_dlp_native_audio(&yt_dlp, &stage_dir, &output_template, &url, &child_path)?
-            } else {
-                return Err(format_yt_dlp_error(&out));
-            }
-        }
-    } else {
-        // Without ffmpeg, `-x --audio-format mp3` cannot transcode non-MP3 streams, so download
-        // the best directly decodable audio stream supported by rodio/symphonia.
-        run_yt_dlp_native_audio(&yt_dlp, &stage_dir, &output_template, &url, &child_path)?
-    };
+    let out = run_yt_dlp_mp3(&yt_dlp, &ffmpeg_bin, &output_template, &url, &child_path)?;
+    if !out.status.success() {
+        clear_dir_files(&stage_dir);
+        return Err(format_yt_dlp_error(&out));
+    }
 
-    let processed_file = maybe_convert_with_platform_tool(&downloaded_file, &stage_dir)?;
+    let downloaded_file = find_first_file_in_dir(&stage_dir)?;
     let staged_stem = downloaded_file
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("YouTube Sound");
     let clean_title = clean_title_from_stem(staged_stem);
 
-    let ext = processed_file
+    let ext = downloaded_file
         .extension()
         .and_then(|e| e.to_str())
         .filter(|e| !e.trim().is_empty())
@@ -237,12 +227,13 @@ fn download_youtube_audio_sync(
     let rel_path = PathBuf::from(SOUNDS_SUBDIR).join(&final_filename);
     let final_path = sounds_dir.join(&final_filename);
 
-    move_or_copy_file(&processed_file, &final_path).map_err(|err| {
+    move_or_copy_file(&downloaded_file, &final_path).map_err(|err| {
         format!(
             "Failed to save downloaded audio to '{}': {err}",
             final_path.display()
         )
     })?;
+    clear_dir_files(&stage_dir);
 
     on_progress("Analyzing waveform & duration...".to_string());
     match audio.probe_audio_with_peaks(&rel_path) {
@@ -254,13 +245,7 @@ fn download_youtube_audio_sync(
         }),
         Err(err) => {
             let _ = fs::remove_file(&final_path);
-            if ffmpeg.is_none() {
-                Err(format!(
-                    "Downloaded '.{ext}' stream could not be decoded without ffmpeg ({err:#}). Install ffmpeg or place ffmpeg in WaweFX/bin/ to enable MP3 conversion."
-                ))
-            } else {
-                Err(format!("Downloaded audio could not be decoded: {err:#}"))
-            }
+            Err(format!("Downloaded audio could not be decoded: {err:#}"))
         }
     }
 }
@@ -293,74 +278,6 @@ fn run_yt_dlp_mp3(
         .map_err(|err| format!("Failed to launch yt-dlp ('{}'): {err}", yt_dlp.display()))
 }
 
-fn run_yt_dlp_native_audio(
-    yt_dlp: &Path,
-    stage_dir: &Path,
-    output_template: &str,
-    url: &str,
-    child_path: &OsString,
-) -> Result<PathBuf, String> {
-    let mut cmd = Command::new(yt_dlp);
-    cmd.args([
-        "--no-playlist",
-        "--no-progress",
-        "-f",
-        "bestaudio[acodec^=vorbis]/bestaudio[ext=ogg]/bestaudio[ext=mp3]/bestaudio[ext=wav]/bestaudio[ext=flac]/bestaudio",
-        "-o",
-        output_template,
-        "--",
-        url,
-    ])
-    .env("PATH", child_path);
-    apply_no_window(&mut cmd);
-
-    let out = cmd
-        .output()
-        .map_err(|err| format!("Failed to launch yt-dlp ('{}'): {err}", yt_dlp.display()))?;
-    if !out.status.success() {
-        return Err(format_yt_dlp_error(&out));
-    }
-    find_first_file_in_dir(stage_dir)
-}
-
-#[cfg(target_os = "macos")]
-fn maybe_convert_with_platform_tool(downloaded: &Path, stage_dir: &Path) -> Result<PathBuf, String> {
-    let ext = downloaded
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase());
-    if matches!(ext.as_deref(), Some("m4a" | "aac" | "mp4")) {
-        let afconvert = Path::new("/usr/bin/afconvert");
-        if afconvert.is_file() {
-            let stem = downloaded
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("audio");
-            let wav_out = stage_dir.join(format!("{stem}.wav"));
-            let out = Command::new(afconvert)
-                .args(["-f", "WAVE", "-d", "LEI16"])
-                .arg(downloaded)
-                .arg(&wav_out)
-                .output();
-            if let Ok(res) = out
-                && res.status.success()
-                && wav_out.is_file()
-            {
-                return Ok(wav_out);
-            }
-        }
-    }
-    Ok(downloaded.to_path_buf())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn maybe_convert_with_platform_tool(
-    downloaded: &Path,
-    _stage_dir: &Path,
-) -> Result<PathBuf, String> {
-    Ok(downloaded.to_path_buf())
-}
-
 #[cfg(target_os = "windows")]
 fn apply_no_window(cmd: &mut Command) {
     use std::os::windows::process::CommandExt;
@@ -388,9 +305,20 @@ fn find_first_file_in_dir(dir: &Path) -> Result<PathBuf, String> {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) != Some("part"))
+        .filter(|p| {
+            !matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("part" | "ytdl")
+            )
+        })
         .collect();
-    files.sort();
+    files.sort_by_key(|p| {
+        let is_mp3 = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("mp3"));
+        (!is_mp3, p.clone())
+    });
     files.into_iter().next().ok_or_else(|| {
         "yt-dlp finished without producing an audio file. Check the URL and try again.".to_string()
     })
@@ -518,7 +446,7 @@ fn ensure_yt_dlp_binary(on_progress: &dyn Fn(String)) -> Result<PathBuf, String>
     let part_path = bin_dir.join(format!("{dest_name}.part"));
     let _ = fs::remove_file(&part_path);
 
-    on_progress("Downloading yt-dlp helper into WaweFX/bin/...".to_string());
+    on_progress("Downloading yt-dlp & ffmpeg (first-time setup)...".to_string());
 
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(YT_DLP_TIMEOUT_SECS))
@@ -566,6 +494,182 @@ fn ensure_yt_dlp_binary(on_progress: &dyn Fn(String)) -> Result<PathBuf, String>
     }
 
     Ok(final_path)
+}
+
+fn platform_ffmpeg_download_spec() -> Option<(
+    &'static [&'static str],
+    &'static [&'static str],
+    &'static str,
+)> {
+    #[cfg(target_os = "windows")]
+    {
+        Some((
+            &["https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"],
+            &["ffmpeg.exe", "ffprobe.exe"],
+            "ffmpeg.exe",
+        ))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some((
+            &[
+                "https://evermeet.cx/ffmpeg/getrelease/zip",
+                "https://evermeet.cx/ffmpeg/get/zip",
+            ],
+            &["ffmpeg"],
+            "ffmpeg",
+        ))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Extracts matching binary filenames from a `.zip` archive into `bin_dir`, returning the primary binary path.
+fn extract_binaries_from_zip<R: Read + Seek>(
+    reader: R,
+    bin_dir: &Path,
+    target_names: &[&str],
+    primary_name: &str,
+) -> Result<PathBuf, String> {
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|err| format!("Failed to read downloaded ffmpeg zip archive: {err}"))?;
+
+    for idx in 0..archive.len() {
+        let mut entry = archive
+            .by_index(idx)
+            .map_err(|err| format!("Failed to read zip entry #{idx}: {err}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let raw_name = entry.name();
+        let base_name = raw_name.rsplit(['/', '\\']).next().unwrap_or(raw_name);
+        let Some(&canonical_name) = target_names
+            .iter()
+            .find(|&&candidate| candidate.eq_ignore_ascii_case(base_name))
+        else {
+            continue;
+        };
+
+        let part_path = bin_dir.join(format!("{canonical_name}.part"));
+        let final_path = bin_dir.join(canonical_name);
+        let _ = fs::remove_file(&part_path);
+
+        let write_res = (|| -> io::Result<()> {
+            let mut out_file = File::create(&part_path)?;
+            io::copy(&mut entry, &mut out_file)?;
+            out_file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_res {
+            let _ = fs::remove_file(&part_path);
+            return Err(format!("Failed extracting '{canonical_name}': {err}"));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) = fs::set_permissions(&part_path, fs::Permissions::from_mode(0o755)) {
+                let _ = fs::remove_file(&part_path);
+                return Err(format!(
+                    "Failed setting executable permissions on '{canonical_name}': {err}"
+                ));
+            }
+        }
+
+        let _ = fs::remove_file(&final_path);
+        if let Err(err) = fs::rename(&part_path, &final_path) {
+            let _ = fs::remove_file(&part_path);
+            return Err(format!("Failed finalizing '{canonical_name}': {err}"));
+        }
+    }
+
+    let primary_path = bin_dir.join(primary_name);
+    if primary_path.is_file() {
+        Ok(primary_path)
+    } else {
+        Err(format!(
+            "Downloaded ffmpeg archive did not contain '{primary_name}'."
+        ))
+    }
+}
+
+/// Locates `ffmpeg` in `WaweFX/bin/` or system `PATH`, or downloads and extracts a standalone static build into `WaweFX/bin/`.
+fn ensure_ffmpeg_binary(on_progress: &dyn Fn(String)) -> Result<PathBuf, String> {
+    if let Some(existing) = resolve_ffmpeg_binary() {
+        return Ok(existing);
+    }
+
+    let Some((urls, target_names, primary_name)) = platform_ffmpeg_download_spec() else {
+        return Err(
+            "ffmpeg was not found in WaweFX/bin/ or PATH. Please install ffmpeg via your package manager."
+                .to_string(),
+        );
+    };
+
+    let bin_dir = AppConfig::bin_dir();
+    fs::create_dir_all(&bin_dir)
+        .map_err(|err| format!("Failed to create '{}': {err}", bin_dir.display()))?;
+
+    on_progress("Downloading yt-dlp & ffmpeg (first-time setup)...".to_string());
+
+    let zip_tmp = bin_dir.join("ffmpeg_download.zip.part");
+    let _ = fs::remove_file(&zip_tmp);
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(FFMPEG_TIMEOUT_SECS))
+        .build();
+
+    let mut last_err = String::from("no download URLs configured");
+    let mut downloaded_ok = false;
+
+    for &url in urls {
+        let _ = fs::remove_file(&zip_tmp);
+        match agent.get(url).set("User-Agent", "WaweFX").call() {
+            Ok(response) if response.status() == 200 => {
+                let copy_res = (|| -> io::Result<()> {
+                    let mut reader = response.into_reader();
+                    let mut out_file = File::create(&zip_tmp)?;
+                    io::copy(&mut reader, &mut out_file)?;
+                    out_file.sync_all()?;
+                    Ok(())
+                })();
+                match copy_res {
+                    Ok(()) => {
+                        downloaded_ok = true;
+                        break;
+                    }
+                    Err(err) => {
+                        last_err = format!("failed writing archive: {err}");
+                    }
+                }
+            }
+            Ok(response) => {
+                last_err = format!("HTTP {}", response.status());
+            }
+            Err(err) => {
+                last_err = err.to_string();
+            }
+        }
+    }
+
+    if !downloaded_ok {
+        let _ = fs::remove_file(&zip_tmp);
+        return Err(format!(
+            "ffmpeg was not found and automatic download failed ({last_err}). Check your internet connection or install ffmpeg."
+        ));
+    }
+
+    let extract_res = (|| -> Result<PathBuf, String> {
+        let file = File::open(&zip_tmp)
+            .map_err(|err| format!("Failed to open downloaded ffmpeg zip: {err}"))?;
+        extract_binaries_from_zip(BufReader::new(file), &bin_dir, target_names, primary_name)
+    })();
+
+    let _ = fs::remove_file(&zip_tmp);
+    extract_res
 }
 
 /// Strips a trailing ` [<youtube_id>]` suffix from a downloaded filename stem.
@@ -619,11 +723,16 @@ fn format_yt_dlp_error(output: &Output) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{Cursor, Write};
     use std::path::PathBuf;
 
     use uuid::Uuid;
+    use zip::write::SimpleFileOptions;
 
-    use super::{clean_title_from_stem, resolve_binary_in_dirs, validate_youtube_url};
+    use super::{
+        clean_title_from_stem, extract_binaries_from_zip, resolve_binary_in_dirs,
+        validate_youtube_url,
+    };
 
     #[test]
     fn validates_standard_watch_shorts_and_short_youtube_urls() {
@@ -700,5 +809,52 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extracts_ffmpeg_binary_from_nested_zip_archive() {
+        let mut zip_buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut zip_buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer
+                .start_file("ffmpeg-master-latest-win64-gpl/LICENSE.txt", opts)
+                .unwrap();
+            writer.write_all(b"GPLv3").unwrap();
+
+            writer
+                .start_file("ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe", opts)
+                .unwrap();
+            writer.write_all(b"FAKE_FFMPEG_BINARY").unwrap();
+
+            writer
+                .start_file("ffmpeg-master-latest-win64-gpl/bin/ffprobe.exe", opts)
+                .unwrap();
+            writer.write_all(b"FAKE_FFPROBE_BINARY").unwrap();
+
+            writer.finish().unwrap();
+        }
+
+        let bin_dir =
+            std::env::temp_dir().join(format!("wawefx_ffmpeg_zip_{}", Uuid::new_v4()));
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        let extracted = extract_binaries_from_zip(
+            Cursor::new(&zip_buf),
+            &bin_dir,
+            &["ffmpeg.exe", "ffprobe.exe"],
+            "ffmpeg.exe",
+        )
+        .expect("extract ffmpeg from zip");
+
+        assert_eq!(extracted, bin_dir.join("ffmpeg.exe"));
+        assert_eq!(fs::read(&extracted).unwrap(), b"FAKE_FFMPEG_BINARY");
+        assert_eq!(
+            fs::read(bin_dir.join("ffprobe.exe")).unwrap(),
+            b"FAKE_FFPROBE_BINARY"
+        );
+
+        let _ = fs::remove_dir_all(&bin_dir);
     }
 }

@@ -21,6 +21,7 @@ anyhow = "1.0"
 dirs = "6"
 ureq = "2.12"
 tracing = "0.1"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
