@@ -967,6 +967,7 @@ impl eframe::App for WaweFxApp {
                 self.audio.apply_routing_config(&self.config.audio);
                 sync_dirty = true;
             }
+            let saved_sound = outcome.save_sound.is_some();
             if let Some(draft) = outcome.save_sound {
                 self.apply_saved_sound(draft);
                 config_dirty = true;
@@ -978,6 +979,12 @@ impl eframe::App for WaweFxApp {
             } else if !outcome.close_modal {
                 self.active_modal = Some(modal);
             } else {
+                if !saved_sound
+                    && let ActiveModal::SoundEditor(ref draft) = modal
+                    && let Some(ref audio_path) = draft.audio_path
+                {
+                    self.config.cleanup_managed_path(audio_path);
+                }
                 if self.audio.active_sound_id().as_deref() == Some(PREVIEW_SOUND_ID) {
                     self.audio.stop();
                 }

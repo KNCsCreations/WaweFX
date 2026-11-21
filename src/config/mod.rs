@@ -18,6 +18,9 @@ pub const SOUNDS_SUBDIR: &str = "sounds";
 /// Managed subdirectory inside the WaweFX AppData root holding copied pad cover images.
 pub const COVERS_SUBDIR: &str = "covers";
 
+/// Managed subdirectory inside the WaweFX AppData root holding helper binaries (e.g. `yt-dlp`).
+pub const BIN_SUBDIR: &str = "bin";
+
 /// Uniform internal audio mixer sample rate (Hz) used across normalized sound buffers.
 pub const TARGET_SAMPLE_RATE: u32 = 48_000;
 
@@ -468,7 +471,17 @@ impl AppConfig {
         }
     }
 
-    /// Ensures `<data_dir>`, `<data_dir>/sounds`, and `<data_dir>/covers` exist on disk.
+    /// Returns `<data_dir>/sounds`.
+    pub fn sounds_dir() -> PathBuf {
+        Self::data_dir().join(SOUNDS_SUBDIR)
+    }
+
+    /// Returns `<data_dir>/bin`.
+    pub fn bin_dir() -> PathBuf {
+        Self::data_dir().join(BIN_SUBDIR)
+    }
+
+    /// Ensures `<data_dir>`, `<data_dir>/sounds`, `<data_dir>/covers`, and `<data_dir>/bin` exist on disk.
     pub fn ensure_data_dirs() -> anyhow::Result<PathBuf> {
         let base = Self::data_dir();
         Self::ensure_data_dirs_in(&base)?;
@@ -476,7 +489,7 @@ impl AppConfig {
     }
 
     fn ensure_data_dirs_in(base_dir: &Path) -> anyhow::Result<()> {
-        for sub in [SOUNDS_SUBDIR, COVERS_SUBDIR] {
+        for sub in [SOUNDS_SUBDIR, COVERS_SUBDIR, BIN_SUBDIR] {
             let dir = base_dir.join(sub);
             fs::create_dir_all(&dir).with_context(|| {
                 format!("failed to create managed storage directory {}", dir.display())
@@ -1359,7 +1372,7 @@ mod tests {
     }
 }
 
-fn sanitize_filename_stem(stem: &str) -> String {
+pub fn sanitize_filename_stem(stem: &str) -> String {
     let mut out = String::with_capacity(stem.len().min(32));
     for ch in stem.chars() {
         if out.len() >= 32 {

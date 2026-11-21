@@ -1,9 +1,11 @@
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Stroke, Vec2};
 use qrcode::{Color as QrColor, QrCode};
 
+use crate::audio::yt_downloader::{self, YoutubeDownloadEvent};
 use crate::audio::{AudioDeviceList, AudioEngine, AudioEngineStatus, PREVIEW_SOUND_ID, apo_installer};
 use crate::config::{
     AppConfig, MAX_PITCH_STEP, MIN_PITCH_STEP, MIN_TRIM_GAP, ShortcutOwner, SoundItem, ThemeConfig,
@@ -248,6 +250,10 @@ pub struct SoundModalDraft {
     pub recording_shortcut: bool,
     pub shortcut_conflict_notice: Option<String>,
     pub error_message: Option<String>,
+    pub youtube_url: String,
+    pub youtube_downloading: bool,
+    pub youtube_status: Option<String>,
+    pub youtube_rx: Option<Arc<Mutex<Receiver<YoutubeDownloadEvent>>>>,
 }
 
 impl SoundModalDraft {
@@ -268,6 +274,10 @@ impl SoundModalDraft {
             recording_shortcut: false,
             shortcut_conflict_notice: None,
             error_message: None,
+            youtube_url: String::new(),
+            youtube_downloading: false,
+            youtube_status: None,
+            youtube_rx: None,
         }
     }
 
@@ -289,6 +299,10 @@ impl SoundModalDraft {
             recording_shortcut: false,
             shortcut_conflict_notice: None,
             error_message: None,
+            youtube_url: String::new(),
+            youtube_downloading: false,
+            youtube_status: None,
+            youtube_rx: None,
         }
     }
 
@@ -377,6 +391,99 @@ fn keep_modal_on_top(
     }
 }
 
+fn poll_youtube_download(draft: &mut SoundModalDraft, config: &AppConfig) {
+    let Some(rx_arc) = draft.youtube_rx.clone() else {
+        return;
+    };
+
+    let mut finished = false;
+    let mut disconnected = false;
+    {
+        if let Ok(rx) = rx_arc.lock() {
+            loop {
+                match rx.try_recv() {
+                    Ok(YoutubeDownloadEvent::Progress(msg)) => {
+                        draft.youtube_status = Some(msg);
+                    }
+                    Ok(YoutubeDownloadEvent::Completed {
+                        audio_path,
+                        clean_title,
+                        duration_secs,
+                        waveform_peaks,
+                    }) => {
+                        if let Some(prev_audio) = draft.audio_path.take() {
+                            config.cleanup_managed_path(&prev_audio);
+                        }
+                        draft.audio_path = Some(audio_path.clone());
+                        draft.duration_secs = duration_secs;
+                        draft.trim_start = 0.0;
+                        draft.trim_end = 1.0;
+                        draft.waveform_peaks = Some(waveform_peaks);
+                        draft.waveform_loaded_for = Some(audio_path);
+                        if draft.title.trim().is_empty() {
+                            draft.title = clean_title;
+                        }
+                        draft.youtube_downloading = false;
+                        draft.youtube_status = None;
+                        draft.error_message = None;
+                        finished = true;
+                        break;
+                    }
+                    Ok(YoutubeDownloadEvent::Failed(err)) => {
+                        draft.youtube_downloading = false;
+                        draft.youtube_status = None;
+                        draft.error_message = Some(err);
+                        finished = true;
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if disconnected && draft.youtube_downloading {
+        draft.youtube_downloading = false;
+        draft.youtube_status = None;
+        if draft.error_message.is_none() {
+            draft.error_message =
+                Some("YouTube download worker terminated unexpectedly.".to_string());
+        }
+        finished = true;
+    }
+
+    if finished || disconnected {
+        draft.youtube_rx = None;
+    }
+}
+
+fn start_youtube_download(ctx: &egui::Context, draft: &mut SoundModalDraft, audio: &AudioEngine) {
+    if draft.youtube_downloading {
+        return;
+    }
+    match yt_downloader::validate_youtube_url(&draft.youtube_url) {
+        Ok(normalized) => {
+            draft.youtube_url = normalized.clone();
+            draft.youtube_downloading = true;
+            draft.youtube_status = Some("Downloading & converting audio...".to_string());
+            draft.error_message = None;
+            let rx = yt_downloader::spawn_youtube_download(
+                normalized,
+                audio.clone(),
+                ctx.clone(),
+            );
+            draft.youtube_rx = Some(Arc::new(Mutex::new(rx)));
+        }
+        Err(err) => {
+            draft.error_message = Some(err);
+        }
+    }
+}
+
 fn render_sound_editor_modal(
     ctx: &egui::Context,
     draft: &mut SoundModalDraft,
@@ -384,6 +491,8 @@ fn render_sound_editor_modal(
     audio: &AudioEngine,
     outcome: &mut ModalOutcome,
 ) {
+    poll_youtube_download(draft, config);
+
     if draft.audio_path.as_ref() != draft.waveform_loaded_for.as_ref() {
         if let Some(ref path) = draft.audio_path {
             draft.waveform_peaks = audio.waveform_peaks_for_path(path).ok();
@@ -435,7 +544,9 @@ fn render_sound_editor_modal(
                             egui::Label::new(egui::RichText::new(audio_label).monospace())
                                 .truncate(),
                         );
-                        if ui.button("Browse Audio...").clicked()
+                        if ui
+                            .add_enabled(!draft.youtube_downloading, egui::Button::new("Browse Audio..."))
+                            .clicked()
                             && let Some(path) = rfd::FileDialog::new()
                                 .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac"])
                                 .pick_file()
@@ -447,6 +558,11 @@ fn render_sound_editor_modal(
                             }
                             match audio.probe_audio_with_peaks(&path) {
                                 Ok((secs, peaks)) => {
+                                    if let Some(prev_audio) = draft.audio_path.take()
+                                        && prev_audio != path
+                                    {
+                                        config.cleanup_managed_path(&prev_audio);
+                                    }
                                     draft.duration_secs = secs;
                                     draft.trim_start = 0.0;
                                     draft.trim_end = 1.0;
@@ -463,6 +579,45 @@ fn render_sound_editor_modal(
                         }
                     });
                     ui.end_row();
+
+                    ui.label("YouTube URL:");
+                    let mut trigger_yt_download = false;
+                    ui.horizontal(|ui| {
+                        let url_resp = ui.add_enabled(
+                            !draft.youtube_downloading,
+                            egui::TextEdit::singleline(&mut draft.youtube_url)
+                                .desired_width(258.0)
+                                .hint_text("Paste YouTube video or Shorts URL..."),
+                        );
+                        let can_download =
+                            !draft.youtube_url.trim().is_empty() && !draft.youtube_downloading;
+                        if ui
+                            .add_enabled(can_download, egui::Button::new("Download"))
+                            .clicked()
+                            || (can_download
+                                && url_resp.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                        {
+                            trigger_yt_download = true;
+                        }
+                    });
+                    if trigger_yt_download {
+                        start_youtube_download(ctx, draft, audio);
+                    }
+                    ui.end_row();
+
+                    if draft.youtube_downloading {
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            let status = draft
+                                .youtube_status
+                                .as_deref()
+                                .unwrap_or("Downloading & converting audio...");
+                            ui.label(egui::RichText::new(status).weak().size(11.5));
+                        });
+                        ui.end_row();
+                    }
 
                     ui.label("Cover Image:");
                     ui.horizontal(|ui| {
@@ -576,7 +731,8 @@ fn render_sound_editor_modal(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let shortcut_valid = draft.shortcut_input.trim().is_empty()
                         || hotkeys::parse_shortcut(&draft.shortcut_input).is_ok();
-                    let can_save = draft.audio_path.is_some() && shortcut_valid;
+                    let can_save =
+                        draft.audio_path.is_some() && shortcut_valid && !draft.youtube_downloading;
                     if ui
                         .add_enabled(can_save, primary_accent_button("Save Sound", &config.theme))
                         .clicked()

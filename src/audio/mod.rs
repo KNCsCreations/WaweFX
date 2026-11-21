@@ -1,5 +1,6 @@
 pub mod apo_installer;
 pub mod mixer;
+pub mod yt_downloader;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
