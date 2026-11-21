@@ -536,6 +536,7 @@ impl AppConfig {
             Some(image::ImageFormat::Jpeg) => ("jpg", bytes.to_vec()),
             Some(image::ImageFormat::WebP) => ("webp", bytes.to_vec()),
             Some(image::ImageFormat::Bmp) => ("bmp", bytes.to_vec()),
+            Some(image::ImageFormat::Gif) => ("gif", bytes.to_vec()),
             _ => {
                 use image::ImageEncoder;
                 let rgba = decoded.to_rgba8();
@@ -1325,6 +1326,33 @@ mod tests {
         assert_eq!(rel.extension().and_then(|e| e.to_str()), Some("png"));
         let full = AppConfig::resolve_asset_path_in(&root, &rel);
         assert!(full.is_file());
+
+        // Animated GIF bytes must be saved with .gif extension and raw bytes intact (not re-encoded to PNG)
+        let mut gif_bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif_bytes);
+            let f1 = image::Frame::from_parts(
+                RgbaImage::from_pixel(8, 8, Rgba([255, 0, 0, 255])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(60, 1),
+            );
+            let f2 = image::Frame::from_parts(
+                RgbaImage::from_pixel(8, 8, Rgba([0, 255, 0, 255])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(80, 1),
+            );
+            encoder.encode_frames([f1, f2]).expect("encode animated gif");
+        }
+        let gif_rel =
+            AppConfig::import_cover_bytes_into_dir(&root, &gif_bytes, Some("party.gif"))
+                .expect("import gif cover bytes");
+        assert!(gif_rel.starts_with(COVERS_SUBDIR));
+        assert_eq!(gif_rel.extension().and_then(|e| e.to_str()), Some("gif"));
+        let gif_full = AppConfig::resolve_asset_path_in(&root, &gif_rel);
+        assert_eq!(fs::read(&gif_full).expect("read saved gif"), gif_bytes);
+
         assert!(AppConfig::import_cover_bytes_into_dir(&root, b"not an image", None).is_err());
 
         let _ = fs::remove_dir_all(&root);

@@ -714,6 +714,14 @@ fn encode_resized_thumbnail(path: &Path) -> Option<(&'static str, Bytes)> {
         .map(|s| s.to_ascii_lowercase());
 
     let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    if reader.format() == Some(ImageFormat::Gif) || ext.as_deref() == Some("gif") {
+        let gif_bytes = std::fs::read(path).ok()?;
+        if image::codecs::gif::GifDecoder::new(Cursor::new(gif_bytes.as_slice())).is_ok() {
+            return Some(("image/gif", Bytes::from(gif_bytes)));
+        }
+        return None;
+    }
+
     let decoded = reader.decode().ok()?;
     let resized = decoded.thumbnail(256, 256);
     let mut cursor = Cursor::new(Vec::new());
@@ -2134,5 +2142,36 @@ mod tests {
         let (ctype, bytes) = encoded.expect("thumbnail encoded");
         assert_eq!(ctype, "image/png");
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn serves_gif_thumbnails_with_image_gif_content_type() {
+        let temp_gif =
+            std::env::temp_dir().join(format!("wawefx_thumb_{}.gif", uuid::Uuid::new_v4()));
+        let mut gif_bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif_bytes);
+            let f1 = image::Frame::from_parts(
+                image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 128, 255])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(50, 1),
+            );
+            let f2 = image::Frame::from_parts(
+                image::RgbaImage::from_pixel(16, 16, image::Rgba([0, 200, 255, 255])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(50, 1),
+            );
+            encoder.encode_frames([f1, f2]).expect("encode gif");
+        }
+        std::fs::write(&temp_gif, &gif_bytes).expect("write temp gif");
+
+        let encoded = encode_resized_thumbnail(&temp_gif);
+        let _ = std::fs::remove_file(&temp_gif);
+
+        let (ctype, served_bytes) = encoded.expect("gif thumbnail encoded");
+        assert_eq!(ctype, "image/gif");
+        assert_eq!(served_bytes.as_ref(), gif_bytes.as_slice());
     }
 }

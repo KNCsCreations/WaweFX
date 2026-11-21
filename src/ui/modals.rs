@@ -471,13 +471,18 @@ fn render_sound_editor_modal(
                             .as_ref()
                             .and_then(|p| p.file_name())
                             .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "Optional (.png / .jpg / .webp / .bmp)".to_string());
+                            .unwrap_or_else(|| {
+                                "Optional (.png / .jpg / .webp / .bmp / .gif)".to_string()
+                            });
                         ui.add(
                             egui::Label::new(egui::RichText::new(img_label).weak()).truncate(),
                         );
                         if ui.button("Browse Image...").clicked()
                             && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Image Files", &["png", "jpg", "jpeg", "webp", "bmp"])
+                                .add_filter(
+                                    "Image Files",
+                                    &["png", "jpg", "jpeg", "webp", "bmp", "gif"],
+                                )
                                 .pick_file()
                         {
                             draft.image_path = Some(path);

@@ -3,15 +3,22 @@ pub mod modals;
 pub mod toolbar;
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
-use image::ImageReader;
+use image::codecs::gif::GifDecoder;
 use image::imageops::FilterType;
+use image::{AnimationDecoder, DynamicImage, ImageFormat, ImageReader, RgbaImage};
 use uuid::Uuid;
+
+const COVER_THUMB_MAX_DIM: u32 = 256;
+const MIN_GIF_DELAY: Duration = Duration::from_millis(20);
+const FALLBACK_GIF_DELAY: Duration = Duration::from_millis(50);
 
 /// Embedded WaweFX brand logo PNG bytes compiled directly into the standalone binary.
 pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../assets/logo.png");
@@ -31,19 +38,48 @@ struct DecodeRequest {
     ctx: egui::Context,
 }
 
+#[derive(Clone)]
+struct DecodedGifFrame {
+    image: ColorImage,
+    delay: Duration,
+}
+
+#[derive(Clone)]
+enum DecodedCover {
+    Static(ColorImage),
+    Animated {
+        frames: Vec<DecodedGifFrame>,
+        total_duration: Duration,
+    },
+}
+
+struct GifFrame {
+    handle: TextureHandle,
+    delay: Duration,
+}
+
+enum CachedCover {
+    Static(TextureHandle),
+    Animated {
+        frames: Vec<GifFrame>,
+        total_duration: Duration,
+    },
+}
+
 struct DecodedThumbnail {
     sound_id: String,
     path: PathBuf,
-    image: ColorImage,
+    cover: DecodedCover,
 }
 
-/// Non-blocking thumbnail loader that decodes and downscales images on a worker thread.
+/// Non-blocking thumbnail loader that decodes and downscales images (and animated GIFs) on a worker thread.
 pub struct ThumbnailLoader {
     req_tx: Sender<DecodeRequest>,
     res_rx: Receiver<DecodedThumbnail>,
-    textures: HashMap<String, (PathBuf, TextureHandle)>,
+    textures: HashMap<String, (PathBuf, CachedCover)>,
     pending: HashSet<(String, PathBuf)>,
     failed: HashSet<(String, PathBuf)>,
+    generation: u64,
 }
 
 impl ThumbnailLoader {
@@ -55,13 +91,13 @@ impl ThumbnailLoader {
             .name("wawefx-thumbnail-loader".to_string())
             .spawn(move || {
                 while let Ok(req) = req_rx.recv() {
-                    if let Some(color_img) = decode_thumbnail_image(&req.path) {
+                    if let Some(cover) = decode_cover_image(&req.path) {
                         let ctx = req.ctx;
                         if res_tx
                             .send(DecodedThumbnail {
                                 sound_id: req.sound_id,
                                 path: req.path,
-                                image: color_img,
+                                cover,
                             })
                             .is_ok()
                         {
@@ -78,6 +114,7 @@ impl ThumbnailLoader {
             textures: HashMap::new(),
             pending: HashSet::new(),
             failed: HashSet::new(),
+            generation: 0,
         }
     }
 
@@ -85,25 +122,34 @@ impl ThumbnailLoader {
     pub fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(item) = self.res_rx.try_recv() {
             self.pending.remove(&(item.sound_id.clone(), item.path.clone()));
-            let handle = ctx.load_texture(
-                format!("pad_thumb_{}", item.sound_id),
-                item.image,
-                TextureOptions::LINEAR,
+            self.generation = self.generation.wrapping_add(1);
+            let cached = upload_cover_texture(
+                ctx,
+                &format!("pad_thumb_{}", item.sound_id),
+                self.generation,
+                item.cover,
             );
-            self.textures.insert(item.sound_id, (item.path, handle));
+            self.textures.insert(item.sound_id, (item.path, cached));
         }
     }
 
-    /// Returns a cached texture if ready, or schedules an async background decode if missing.
+    /// Returns a cached texture if ready (advancing animated GIFs cleanly), or schedules an async decode.
     pub fn texture_for(&mut self, ctx: &egui::Context, sound: &SoundItem) -> Option<&TextureHandle> {
-        let path = sound.resolved_image_path()?;
-
-        if let Some((cached_path, _)) = self.textures.get(&sound.id) {
-            if *cached_path == path {
-                return self.textures.get(&sound.id).map(|(_, h)| h);
-            }
+        let Some(path) = sound.resolved_image_path() else {
             self.textures.remove(&sound.id);
+            self.pending.retain(|(id, _)| id != &sound.id);
+            return None;
+        };
+
+        let cache_hit = self
+            .textures
+            .get(&sound.id)
+            .is_some_and(|(cached_path, _)| *cached_path == path);
+        if cache_hit {
+            let (_, cached) = self.textures.get(&sound.id)?;
+            return Some(select_cover_texture(cached, ctx));
         }
+        self.textures.remove(&sound.id);
 
         let key = (sound.id.clone(), path.clone());
         if !self.pending.contains(&key) && !self.failed.contains(&key) {
@@ -129,22 +175,28 @@ impl ThumbnailLoader {
         self.failed.retain(|(id, _)| id != sound_id);
     }
 
-    /// Uploads a freshly decoded image immediately as a GPU texture for zero-lag cover updates.
-    pub fn set_decoded(
+    /// Uploads a freshly decoded cover immediately as GPU texture(s) for zero-lag cover updates.
+    fn set_decoded(
         &mut self,
         ctx: &egui::Context,
         sound_id: &str,
         path: PathBuf,
-        image: ColorImage,
+        cover: DecodedCover,
     ) {
+        self.generation = self.generation.wrapping_add(1);
+        let cached = upload_cover_texture(
+            ctx,
+            &format!("pad_thumb_{sound_id}"),
+            self.generation,
+            cover,
+        );
+        self.set_cached(sound_id, path, cached);
+    }
+
+    fn set_cached(&mut self, sound_id: &str, path: PathBuf, cached: CachedCover) {
         self.pending.retain(|(id, _)| id != sound_id);
         self.failed.retain(|(id, _)| id != sound_id);
-        let handle = ctx.load_texture(
-            format!("pad_thumb_{sound_id}"),
-            image,
-            TextureOptions::LINEAR,
-        );
-        self.textures.insert(sound_id.to_string(), (path, handle));
+        self.textures.insert(sound_id.to_string(), (path, cached));
     }
 }
 
@@ -154,19 +206,148 @@ impl Default for ThumbnailLoader {
     }
 }
 
-fn decode_thumbnail_image(path: &Path) -> Option<ColorImage> {
-    let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
-    let decoded = reader.decode().ok()?;
-    let thumb = decoded.thumbnail(256, 256).to_rgba8();
+fn rgba_to_color_image(thumb: RgbaImage) -> ColorImage {
     let size = [thumb.width() as usize, thumb.height() as usize];
-    Some(ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()))
+    ColorImage::from_rgba_unmultiplied(size, thumb.as_raw())
 }
 
-fn decode_thumbnail_bytes(bytes: &[u8]) -> Option<ColorImage> {
-    let decoded = image::load_from_memory(bytes).ok()?;
-    let thumb = decoded.thumbnail(256, 256).to_rgba8();
-    let size = [thumb.width() as usize, thumb.height() as usize];
-    Some(ColorImage::from_rgba_unmultiplied(size, thumb.as_raw()))
+fn normalize_gif_delay(delay: image::Delay) -> Duration {
+    let raw = Duration::from(delay);
+    if raw < MIN_GIF_DELAY {
+        FALLBACK_GIF_DELAY
+    } else {
+        raw
+    }
+}
+
+fn decode_gif_frames<R: BufRead + Seek>(reader: R) -> Option<DecodedCover> {
+    let decoder = GifDecoder::new(reader).ok()?;
+    let mut frames = Vec::new();
+    let mut total_duration = Duration::ZERO;
+
+    for frame_res in decoder.into_frames() {
+        let Ok(frame) = frame_res else {
+            break;
+        };
+        let delay = normalize_gif_delay(frame.delay());
+        let thumb = DynamicImage::ImageRgba8(frame.into_buffer())
+            .thumbnail(COVER_THUMB_MAX_DIM, COVER_THUMB_MAX_DIM)
+            .to_rgba8();
+        total_duration = total_duration.saturating_add(delay);
+        frames.push(DecodedGifFrame {
+            image: rgba_to_color_image(thumb),
+            delay,
+        });
+    }
+
+    match frames.len() {
+        0 => None,
+        1 => frames.into_iter().next().map(|f| DecodedCover::Static(f.image)),
+        _ => Some(DecodedCover::Animated {
+            frames,
+            total_duration,
+        }),
+    }
+}
+
+fn decode_cover_from_reader<R: BufRead + Seek>(reader: R) -> Option<DecodedCover> {
+    let img_reader = ImageReader::new(reader).with_guessed_format().ok()?;
+    if img_reader.format() == Some(ImageFormat::Gif) {
+        let mut inner = img_reader.into_inner();
+        let _ = inner.seek(SeekFrom::Start(0));
+        return decode_gif_frames(inner);
+    }
+    let decoded = img_reader.decode().ok()?;
+    let thumb = decoded
+        .thumbnail(COVER_THUMB_MAX_DIM, COVER_THUMB_MAX_DIM)
+        .to_rgba8();
+    Some(DecodedCover::Static(rgba_to_color_image(thumb)))
+}
+
+fn decode_cover_image(path: &Path) -> Option<DecodedCover> {
+    let file = File::open(path).ok()?;
+    decode_cover_from_reader(BufReader::new(file))
+}
+
+fn decode_cover_bytes(bytes: &[u8]) -> Option<DecodedCover> {
+    decode_cover_from_reader(Cursor::new(bytes))
+}
+
+fn upload_cover_texture(
+    ctx: &egui::Context,
+    key_prefix: &str,
+    generation: u64,
+    cover: DecodedCover,
+) -> CachedCover {
+    match cover {
+        DecodedCover::Static(image) => CachedCover::Static(ctx.load_texture(
+            format!("{key_prefix}_{generation}_static"),
+            image,
+            TextureOptions::LINEAR,
+        )),
+        DecodedCover::Animated {
+            frames,
+            total_duration,
+        } => {
+            let uploaded = frames
+                .into_iter()
+                .enumerate()
+                .map(|(idx, frame)| GifFrame {
+                    handle: ctx.load_texture(
+                        format!("{key_prefix}_{generation}_f{idx}"),
+                        frame.image,
+                        TextureOptions::LINEAR,
+                    ),
+                    delay: frame.delay,
+                })
+                .collect();
+            CachedCover::Animated {
+                frames: uploaded,
+                total_duration,
+            }
+        }
+    }
+}
+
+fn active_gif_frame_at<T>(
+    frames: &[T],
+    delay_of: impl Fn(&T) -> Duration,
+    total_duration: Duration,
+    time_secs: f64,
+) -> (usize, Duration) {
+    let total_secs = total_duration.as_secs_f64();
+    if frames.len() <= 1 || total_secs <= 0.0 {
+        return (0, Duration::ZERO);
+    }
+    let loop_pos = time_secs.max(0.0).rem_euclid(total_secs);
+    let mut accum = 0.0;
+    for (idx, frame) in frames.iter().enumerate() {
+        let frame_end = accum + delay_of(frame).as_secs_f64();
+        if loop_pos < frame_end {
+            let remaining = Duration::from_secs_f64((frame_end - loop_pos).max(0.001));
+            return (idx, remaining);
+        }
+        accum = frame_end;
+    }
+    (0, delay_of(&frames[0]))
+}
+
+fn select_cover_texture<'a>(cached: &'a CachedCover, ctx: &egui::Context) -> &'a TextureHandle {
+    match cached {
+        CachedCover::Static(handle) => handle,
+        CachedCover::Animated {
+            frames,
+            total_duration,
+        } => {
+            let now = ctx.input(|i| i.time);
+            let (idx, remaining) =
+                active_gif_frame_at(frames, |f| f.delay, *total_duration, now);
+            if !remaining.is_zero() {
+                ctx.request_repaint_after(remaining);
+            }
+            &frames[idx].handle
+        }
+    }
 }
 
 /// Decodes the embedded `assets/logo.png` into a 256x256 RGBA [`egui::IconData`] for the
@@ -194,8 +375,8 @@ pub fn build_window_icon() -> egui::IconData {
 
 struct PendingCoverDrop {
     managed_cover: PathBuf,
-    color_img: ColorImage,
-    preview_texture: Option<TextureHandle>,
+    cover: DecodedCover,
+    preview_cached: Option<CachedCover>,
 }
 
 /// Root eframe application state for WaweFX.
@@ -853,7 +1034,8 @@ impl WaweFxApp {
         ctx: &egui::Context,
         pad_id: &str,
         managed_cover: PathBuf,
-        color_img: ColorImage,
+        cover: DecodedCover,
+        preuploaded: Option<CachedCover>,
     ) -> bool {
         let resolved_managed = AppConfig::resolve_asset_path(&managed_cover);
         let mut pad_title = String::new();
@@ -877,8 +1059,12 @@ impl WaweFxApp {
         if let Some(prev_path) = old_img {
             self.config.cleanup_managed_path(&prev_path);
         }
-        self.thumbnails
-            .set_decoded(ctx, pad_id, resolved_managed, color_img);
+        if let Some(cached) = preuploaded {
+            self.thumbnails.set_cached(pad_id, resolved_managed, cached);
+        } else {
+            self.thumbnails
+                .set_decoded(ctx, pad_id, resolved_managed, cover);
+        }
         self.sync.invalidate_thumbnail(pad_id);
         self.last_error = None;
         self.status_toast = Some((format!("Updated cover for '{}'", pad_title), Instant::now()));
@@ -894,7 +1080,7 @@ impl WaweFxApp {
             if is_dropped_image(dropped) {
                 if let Some(ref path) = dropped.path
                     && dropped.bytes.is_none()
-                    && decode_thumbnail_image(path).is_some()
+                    && decode_cover_image(path).is_some()
                 {
                     draft.image_path = Some(path.clone());
                     draft.error_message = None;
@@ -950,14 +1136,10 @@ impl WaweFxApp {
             return false;
         };
 
-        let tex = pending.preview_texture.get_or_insert_with(|| {
-            ctx.load_texture(
-                "wawefx_pending_cover_drop_preview",
-                pending.color_img.clone(),
-                TextureOptions::LINEAR,
-            )
+        let preview_cached = pending.preview_cached.get_or_insert_with(|| {
+            upload_cover_texture(ctx, "wawefx_pending_cover_drop_preview", 0, pending.cover.clone())
         });
-        let tex_id = tex.id();
+        let tex_id = select_cover_texture(preview_cached, ctx).id();
 
         let suggested_pad_id =
             find_drop_target_pad(self.last_valid_pointer_pos, pad_rects, None)
@@ -1059,7 +1241,13 @@ impl WaweFxApp {
         }
 
         if let Some(pad_id) = chosen_pad_id {
-            return self.apply_cover_to_pad(ctx, &pad_id, pending.managed_cover, pending.color_img);
+            return self.apply_cover_to_pad(
+                ctx,
+                &pad_id,
+                pending.managed_cover,
+                pending.cover,
+                pending.preview_cached.take(),
+            );
         }
         if !open || cancel {
             self.config.cleanup_managed_path(&pending.managed_cover);
@@ -1115,7 +1303,7 @@ impl WaweFxApp {
                     }
                 }
             } else if is_dropped_image(dropped) {
-                let (managed_cover, color_img) = match import_and_decode_dropped_cover(dropped) {
+                let (managed_cover, cover) = match import_and_decode_dropped_cover(dropped) {
                     Ok(res) => res,
                     Err(err) => {
                         self.last_error = Some(err);
@@ -1146,7 +1334,7 @@ impl WaweFxApp {
                 });
 
                 if let Some(pad_id) = target_pad_id {
-                    if self.apply_cover_to_pad(ctx, &pad_id, managed_cover, color_img) {
+                    if self.apply_cover_to_pad(ctx, &pad_id, managed_cover, cover, None) {
                         changed = true;
                     }
                 } else if self.config.sounds.is_empty() {
@@ -1162,13 +1350,13 @@ impl WaweFxApp {
                     self.last_error = None;
                     self.pending_cover_drop = Some(PendingCoverDrop {
                         managed_cover,
-                        color_img,
-                        preview_texture: None,
+                        cover,
+                        preview_cached: None,
                     });
                 }
             } else if let Some(ref path) = dropped.path {
                 self.last_error = Some(format!(
-                    "Unsupported file type '{}'. Supported: mp3, wav, ogg, flac, png, jpg, jpeg, webp, bmp.",
+                    "Unsupported file type '{}'. Supported: mp3, wav, ogg, flac, png, jpg, jpeg, webp, bmp, gif.",
                     path.display()
                 ));
             } else {
@@ -1192,9 +1380,9 @@ fn is_dropped_image(dropped: &egui::DroppedFile) -> bool {
 
 fn import_and_decode_dropped_cover(
     dropped: &egui::DroppedFile,
-) -> Result<(PathBuf, ColorImage), String> {
+) -> Result<(PathBuf, DecodedCover), String> {
     if let Some(bytes) = dropped.bytes.as_deref() {
-        let color_img = decode_thumbnail_bytes(bytes)
+        let cover = decode_cover_bytes(bytes)
             .ok_or_else(|| "Could not decode dropped image bytes.".to_string())?;
         let hint = dropped
             .path
@@ -1205,11 +1393,11 @@ fn import_and_decode_dropped_cover(
         let managed_cover = AppConfig::import_cover_bytes(bytes, hint).map_err(|err| {
             format!("Failed to save dropped cover into WaweFX data folder: {err:#}")
         })?;
-        return Ok((managed_cover, color_img));
+        return Ok((managed_cover, cover));
     }
 
     if let Some(ref path) = dropped.path {
-        let color_img = decode_thumbnail_image(path)
+        let cover = decode_cover_image(path)
             .ok_or_else(|| format!("Could not decode dropped image '{}'.", path.display()))?;
         let managed_cover = AppConfig::import_cover_file(path).map_err(|err| {
             format!(
@@ -1217,7 +1405,7 @@ fn import_and_decode_dropped_cover(
                 path.display()
             )
         })?;
-        return Ok((managed_cover, color_img));
+        return Ok((managed_cover, cover));
     }
 
     Err("Dropped image does not contain a file path or raw bytes.".to_string())
@@ -1472,7 +1660,7 @@ fn is_audio_file(path: &Path) -> bool {
 }
 
 fn is_image_file(path: &Path) -> bool {
-    has_extension_in(path, &["png", "jpg", "jpeg", "webp", "bmp"])
+    has_extension_in(path, &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
 }
 
 #[cfg(test)]
@@ -1480,20 +1668,22 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::path::Path;
+    use std::time::Duration;
 
+    use image::codecs::gif::GifEncoder;
     use image::codecs::ico::{IcoDecoder, IcoEncoder, IcoFrame};
     use image::codecs::png::PngEncoder;
     use image::imageops::FilterType;
-    use image::{DynamicImage, ExtendedColorType, ImageDecoder, ImageEncoder, Rgba, RgbaImage};
+    use image::{Delay, DynamicImage, ExtendedColorType, Frame, ImageDecoder, ImageEncoder, Rgba, RgbaImage};
 
     use super::{
-        LOGO_PNG_BYTES, build_window_icon, decode_thumbnail_bytes, decode_thumbnail_image,
-        find_drop_target_pad, is_image_file, macos_screen_to_window_local,
+        DecodedCover, LOGO_PNG_BYTES, active_gif_frame_at, build_window_icon, decode_cover_bytes,
+        decode_cover_image, find_drop_target_pad, is_image_file, macos_screen_to_window_local,
     };
 
     #[test]
-    fn image_file_detection_is_case_insensitive_including_bmp() {
-        for ext in ["png", "PNG", "jpg", "JPEG", "webp", "WebP", "bmp", "BMP"] {
+    fn image_file_detection_is_case_insensitive_including_bmp_and_gif() {
+        for ext in ["png", "PNG", "jpg", "JPEG", "webp", "WebP", "bmp", "BMP", "gif", "GIF"] {
             assert!(is_image_file(Path::new(&format!("cover.{ext}"))));
         }
         assert!(!is_image_file(Path::new("sound.wav")));
@@ -1506,9 +1696,11 @@ mod tests {
             std::env::temp_dir().join(format!("wawefx_test_cover_{}.bmp", uuid::Uuid::new_v4()));
         let img = RgbaImage::from_pixel(512, 512, Rgba([64, 180, 240, 255]));
         img.save(&temp_bmp).expect("save temp bmp");
-        let decoded = decode_thumbnail_image(&temp_bmp);
+        let decoded = decode_cover_image(&temp_bmp);
         let _ = fs::remove_file(&temp_bmp);
-        let color_img = decoded.expect("bmp image should decode");
+        let DecodedCover::Static(color_img) = decoded.expect("bmp image should decode") else {
+            panic!("bmp should decode as static cover");
+        };
         assert_eq!(color_img.size, [256, 256]);
         assert_eq!(
             color_img.pixels[0],
@@ -1523,13 +1715,79 @@ mod tests {
         PngEncoder::new(&mut png_bytes)
             .write_image(img.as_raw(), 512, 512, ExtendedColorType::Rgba8)
             .expect("encode png bytes");
-        let decoded = decode_thumbnail_bytes(&png_bytes).expect("bytes should decode");
+        let DecodedCover::Static(decoded) =
+            decode_cover_bytes(&png_bytes).expect("bytes should decode")
+        else {
+            panic!("png should decode as static cover");
+        };
         assert_eq!(decoded.size, [256, 256]);
         assert_eq!(
             decoded.pixels[0],
             eframe::egui::Color32::from_rgba_unmultiplied(220, 90, 40, 255)
         );
-        assert!(decode_thumbnail_bytes(b"invalid image data").is_none());
+        assert!(decode_cover_bytes(b"invalid image data").is_none());
+    }
+
+    #[test]
+    fn decodes_animated_gif_frames_downscales_clamps_delays_and_computes_loop_index() {
+        let mut gif_bytes = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut gif_bytes);
+            let f1 = Frame::from_parts(
+                RgbaImage::from_pixel(400, 300, Rgba([255, 0, 0, 255])),
+                0,
+                0,
+                Delay::from_numer_denom_ms(0, 1),
+            );
+            let f2 = Frame::from_parts(
+                RgbaImage::from_pixel(400, 300, Rgba([0, 255, 0, 255])),
+                0,
+                0,
+                Delay::from_numer_denom_ms(10, 1),
+            );
+            let f3 = Frame::from_parts(
+                RgbaImage::from_pixel(400, 300, Rgba([0, 0, 255, 255])),
+                0,
+                0,
+                Delay::from_numer_denom_ms(90, 1),
+            );
+            encoder.encode_frames([f1, f2, f3]).expect("encode 3-frame gif");
+        }
+
+        let DecodedCover::Animated {
+            frames,
+            total_duration,
+        } = decode_cover_bytes(&gif_bytes).expect("gif should decode")
+        else {
+            panic!("multi-frame gif must decode as animated");
+        };
+
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].image.size, [256, 192]);
+        assert_eq!(frames[1].image.size, [256, 192]);
+        assert_eq!(frames[2].image.size, [256, 192]);
+        assert_eq!(frames[0].delay, Duration::from_millis(50));
+        assert_eq!(frames[1].delay, Duration::from_millis(50));
+        assert_eq!(frames[2].delay, Duration::from_millis(90));
+        assert_eq!(total_duration, Duration::from_millis(190));
+
+        assert_eq!(
+            active_gif_frame_at(&frames, |f| f.delay, total_duration, 0.010),
+            (0, Duration::from_millis(40))
+        );
+        assert_eq!(
+            active_gif_frame_at(&frames, |f| f.delay, total_duration, 0.060),
+            (1, Duration::from_millis(40))
+        );
+        assert_eq!(
+            active_gif_frame_at(&frames, |f| f.delay, total_duration, 0.120),
+            (2, Duration::from_millis(70))
+        );
+        // Loop wraps cleanly past total_duration (0.200 % 0.190 == 0.010)
+        let (wrapped_idx, wrapped_rem) =
+            active_gif_frame_at(&frames, |f| f.delay, total_duration, 0.200);
+        assert_eq!(wrapped_idx, 0);
+        assert!((wrapped_rem.as_secs_f64() - 0.040).abs() < 0.002);
     }
 
     #[test]

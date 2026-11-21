@@ -203,7 +203,12 @@ pub fn render_sound_grid(
                             Vec2::new(img_size, img_size - 6.0),
                         );
 
-                        if let Some(tex) = thumbnails.texture_for(ui.ctx(), sound) {
+                        let cover_tex = if visible_rect.is_positive() {
+                            thumbnails.texture_for(ui.ctx(), sound)
+                        } else {
+                            None
+                        };
+                        if let Some(tex) = cover_tex {
                             let tint = if is_being_dragged {
                                 Color32::from_white_alpha(150)
                             } else {
