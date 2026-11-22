@@ -16,6 +16,7 @@ pub struct GridAction {
     pub play_sound_id: Option<String>,
     pub stop_playback: bool,
     pub edit_sound_id: Option<String>,
+    pub duplicate_sound_id: Option<String>,
     pub assign_shortcut_id: Option<String>,
     pub clear_shortcut_id: Option<String>,
     pub remove_sound_id: Option<String>,
@@ -408,6 +409,10 @@ pub fn render_sound_grid(
                                 }
                                 if ui.button("Edit Sound (...)").clicked() {
                                     action.edit_sound_id = Some(sound.id.clone());
+                                    ui.close_menu();
+                                }
+                                if ui.button("Duplicate").clicked() {
+                                    action.duplicate_sound_id = Some(sound.id.clone());
                                     ui.close_menu();
                                 }
                                 if ui.button("Record Shortcut...").clicked() {

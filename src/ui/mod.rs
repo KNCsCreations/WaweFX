@@ -579,6 +579,20 @@ impl WaweFxApp {
     }
 }
 
+fn duplicate_sound_in_config(config: &mut AppConfig, sound_id: &str) -> bool {
+    let Some(idx) = config.sounds.iter().position(|s| s.id == sound_id) else {
+        return false;
+    };
+    let mut duplicated = config.sounds[idx].clone();
+    let new_id = Uuid::new_v4().to_string();
+    duplicated.id = new_id.clone();
+    duplicated.title = format!("{} (Copy)", duplicated.title);
+    duplicated.shortcut = None;
+    config.sounds.insert(idx + 1, duplicated);
+    config.selected_sound_id = Some(new_id);
+    true
+}
+
 impl eframe::App for WaweFxApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         modals::apply_theme_visuals(ctx, &self.config.theme);
@@ -890,6 +904,12 @@ impl eframe::App for WaweFxApp {
             && let Some(item) = self.config.sounds.iter().find(|s| s.id == edit_id)
         {
             self.active_modal = Some(ActiveModal::SoundEditor(SoundModalDraft::from_existing(item)));
+        }
+        if let Some(dup_id) = grid_action.duplicate_sound_id
+            && duplicate_sound_in_config(&mut self.config, &dup_id)
+        {
+            config_dirty = true;
+            sync_dirty = true;
         }
         if let Some(assign_id) = grid_action.assign_shortcut_id
             && let Some(item) = self.config.sounds.iter().find(|s| s.id == assign_id)
@@ -2065,5 +2085,56 @@ mod tests {
             let resized = img.resize_exact(size, size, FilterType::Lanczos3).to_rgba8();
             write_rgba8_png(&iconset_dir.join(filename), &resized);
         }
+    }
+
+    #[test]
+    fn duplicate_sound_clones_after_original_without_shortcut() {
+        use std::path::PathBuf;
+
+        use super::duplicate_sound_in_config;
+        use crate::config::{AppConfig, SoundItem};
+
+        let mut cfg = AppConfig::default();
+        cfg.sounds = vec![
+            SoundItem {
+                id: "orig-1".to_string(),
+                title: "Airhorn".to_string(),
+                audio_path: PathBuf::from("sounds/airhorn.mp3"),
+                image_path: Some(PathBuf::from("covers/airhorn.gif")),
+                duration_secs: 2.5,
+                volume_trim: 1.25,
+                trim_start: 0.1,
+                trim_end: 0.85,
+                shortcut: Some("Ctrl+F1".to_string()),
+            },
+            SoundItem {
+                id: "other-2".to_string(),
+                title: "Drum".to_string(),
+                audio_path: PathBuf::from("sounds/drum.wav"),
+                image_path: None,
+                duration_secs: 1.0,
+                volume_trim: 1.0,
+                trim_start: 0.0,
+                trim_end: 1.0,
+                shortcut: None,
+            },
+        ];
+
+        assert!(duplicate_sound_in_config(&mut cfg, "orig-1"));
+        assert!(!duplicate_sound_in_config(&mut cfg, "missing-id"));
+        assert_eq!(cfg.sounds.len(), 3);
+
+        let dup = &cfg.sounds[1];
+        assert_ne!(dup.id, "orig-1");
+        assert_eq!(dup.title, "Airhorn (Copy)");
+        assert_eq!(dup.shortcut, None);
+        assert_eq!(dup.audio_path, PathBuf::from("sounds/airhorn.mp3"));
+        assert_eq!(dup.image_path, Some(PathBuf::from("covers/airhorn.gif")));
+        assert_eq!(dup.duration_secs, 2.5);
+        assert_eq!(dup.volume_trim, 1.25);
+        assert_eq!(dup.trim_start, 0.1);
+        assert_eq!(dup.trim_end, 0.85);
+        assert_eq!(cfg.selected_sound_id.as_deref(), Some(dup.id.as_str()));
+        assert_eq!(cfg.sounds[2].id, "other-2");
     }
 }
