@@ -491,7 +491,10 @@ fn render_sound_editor_modal(
     audio: &AudioEngine,
     outcome: &mut ModalOutcome,
 ) {
-    poll_youtube_download(draft, config);
+    let is_new = draft.editing_id.is_none();
+    if is_new {
+        poll_youtube_download(draft, config);
+    }
 
     if draft.audio_path.as_ref() != draft.waveform_loaded_for.as_ref() {
         if let Some(ref path) = draft.audio_path {
@@ -503,10 +506,10 @@ fn render_sound_editor_modal(
         }
     }
 
-    let title = if draft.editing_id.is_some() {
-        "Edit Sound Properties"
-    } else {
+    let title = if is_new {
         "Add New Sound"
+    } else {
+        "Edit Sound Properties"
     };
 
     let mut open = true;
@@ -580,43 +583,45 @@ fn render_sound_editor_modal(
                     });
                     ui.end_row();
 
-                    ui.label("YouTube URL:");
-                    let mut trigger_yt_download = false;
-                    ui.horizontal(|ui| {
-                        let url_resp = ui.add_enabled(
-                            !draft.youtube_downloading,
-                            egui::TextEdit::singleline(&mut draft.youtube_url)
-                                .desired_width(258.0)
-                                .hint_text("Paste YouTube video or Shorts URL..."),
-                        );
-                        let can_download =
-                            !draft.youtube_url.trim().is_empty() && !draft.youtube_downloading;
-                        if ui
-                            .add_enabled(can_download, egui::Button::new("Download"))
-                            .clicked()
-                            || (can_download
-                                && url_resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        {
-                            trigger_yt_download = true;
-                        }
-                    });
-                    if trigger_yt_download {
-                        start_youtube_download(ctx, draft, audio);
-                    }
-                    ui.end_row();
-
-                    if draft.youtube_downloading {
-                        ui.label("");
+                    if is_new {
+                        ui.label("YouTube URL:");
+                        let mut trigger_yt_download = false;
                         ui.horizontal(|ui| {
-                            ui.spinner();
-                            let status = draft
-                                .youtube_status
-                                .as_deref()
-                                .unwrap_or("Downloading & converting audio...");
-                            ui.label(egui::RichText::new(status).weak().size(11.5));
+                            let url_resp = ui.add_enabled(
+                                !draft.youtube_downloading,
+                                egui::TextEdit::singleline(&mut draft.youtube_url)
+                                    .desired_width(258.0)
+                                    .hint_text("Paste YouTube video or Shorts URL..."),
+                            );
+                            let can_download =
+                                !draft.youtube_url.trim().is_empty() && !draft.youtube_downloading;
+                            if ui
+                                .add_enabled(can_download, egui::Button::new("Download"))
+                                .clicked()
+                                || (can_download
+                                    && url_resp.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                            {
+                                trigger_yt_download = true;
+                            }
                         });
+                        if trigger_yt_download {
+                            start_youtube_download(ctx, draft, audio);
+                        }
                         ui.end_row();
+
+                        if draft.youtube_downloading {
+                            ui.label("");
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                let status = draft
+                                    .youtube_status
+                                    .as_deref()
+                                    .unwrap_or("Downloading & converting audio...");
+                                ui.label(egui::RichText::new(status).weak().size(11.5));
+                            });
+                            ui.end_row();
+                        }
                     }
 
                     ui.label("Cover Image:");
