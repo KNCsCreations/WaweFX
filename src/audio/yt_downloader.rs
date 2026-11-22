@@ -1,8 +1,8 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Seek};
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
@@ -178,7 +178,6 @@ fn download_youtube_audio_sync(
         on_progress("Downloading yt-dlp & ffmpeg (first-time setup)...".to_string());
     }
     let yt_dlp = ensure_yt_dlp_binary(on_progress)?;
-    let ffmpeg_bin = ensure_ffmpeg_binary(on_progress)?;
 
     let sounds_dir = AppConfig::sounds_dir();
     let stage_dir = sounds_dir.join(format!(".yt_tmp_{}", Uuid::new_v4().simple()));
@@ -192,15 +191,15 @@ fn download_youtube_audio_sync(
         .into_owned();
     let child_path = build_augmented_path(&AppConfig::bin_dir());
 
-    on_progress("Downloading & converting audio to MP3...".to_string());
+    let downloaded_file = stage_youtube_audio(
+        &yt_dlp,
+        &stage_dir,
+        &output_template,
+        &url,
+        &child_path,
+        on_progress,
+    )?;
 
-    let out = run_yt_dlp_mp3(&yt_dlp, &ffmpeg_bin, &output_template, &url, &child_path)?;
-    if !out.status.success() {
-        clear_dir_files(&stage_dir);
-        return Err(format_yt_dlp_error(&out));
-    }
-
-    let downloaded_file = find_first_file_in_dir(&stage_dir)?;
     let staged_stem = downloaded_file
         .file_stem()
         .and_then(|s| s.to_str())
@@ -250,6 +249,134 @@ fn download_youtube_audio_sync(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn stage_youtube_audio(
+    yt_dlp: &Path,
+    stage_dir: &Path,
+    output_template: &str,
+    url: &str,
+    child_path: &OsString,
+    on_progress: &dyn Fn(String),
+) -> Result<PathBuf, String> {
+    if let Ok(ffmpeg_bin) = ensure_ffmpeg_binary(on_progress) {
+        on_progress("Downloading & converting audio to MP3...".to_string());
+        if let Ok(out) = run_yt_dlp_mp3(yt_dlp, &ffmpeg_bin, output_template, url, child_path)
+            && out.status.success()
+        {
+            return find_first_file_in_dir(stage_dir);
+        }
+        clear_dir_files(stage_dir);
+    }
+
+    run_macos_afconvert_fallback(
+        yt_dlp,
+        stage_dir,
+        output_template,
+        url,
+        child_path,
+        on_progress,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stage_youtube_audio(
+    yt_dlp: &Path,
+    stage_dir: &Path,
+    output_template: &str,
+    url: &str,
+    child_path: &OsString,
+    on_progress: &dyn Fn(String),
+) -> Result<PathBuf, String> {
+    let ffmpeg_bin = ensure_ffmpeg_binary(on_progress)?;
+    on_progress("Downloading & converting audio to MP3...".to_string());
+
+    let out = run_yt_dlp_mp3(yt_dlp, &ffmpeg_bin, output_template, url, child_path)?;
+    if !out.status.success() {
+        clear_dir_files(stage_dir);
+        return Err(format_yt_dlp_error(&out));
+    }
+
+    find_first_file_in_dir(stage_dir)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn build_afconvert_wav_path(input_path: &Path) -> PathBuf {
+    if input_path.file_stem().is_some() {
+        input_path.with_extension("wav")
+    } else {
+        input_path.join("audio.wav")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn convert_audio_with_afconvert(input_path: &Path) -> Result<PathBuf, String> {
+    if input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+    {
+        return Ok(input_path.to_path_buf());
+    }
+
+    let wav_path = build_afconvert_wav_path(input_path);
+    let _ = fs::remove_file(&wav_path);
+
+    let out = Command::new("/usr/bin/afconvert")
+        .args(["-f", "WAVE", "-d", "LEI16"])
+        .arg(input_path)
+        .arg(&wav_path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("Failed to run /usr/bin/afconvert: {err}"))?;
+
+    if !out.status.success() || !wav_path.is_file() {
+        let _ = fs::remove_file(&wav_path);
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("exit code {:?}", out.status.code())
+        } else {
+            stderr
+        };
+        return Err(format!("macOS afconvert failed: {detail}"));
+    }
+
+    let _ = fs::remove_file(input_path);
+    Ok(wav_path)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_afconvert_fallback(
+    yt_dlp: &Path,
+    stage_dir: &Path,
+    output_template: &str,
+    url: &str,
+    child_path: &OsString,
+    on_progress: &dyn Fn(String),
+) -> Result<PathBuf, String> {
+    on_progress("Downloading audio & converting via macOS afconvert...".to_string());
+    let out = run_yt_dlp_m4a(yt_dlp, output_template, url, child_path)?;
+    if !out.status.success() {
+        clear_dir_files(stage_dir);
+        return Err(format_yt_dlp_error(&out));
+    }
+
+    let downloaded_m4a = find_first_file_in_dir(stage_dir)?;
+    convert_audio_with_afconvert(&downloaded_m4a)
+}
+
+fn run_yt_dlp_cmd(
+    yt_dlp: &Path,
+    args: &[&OsStr],
+    child_path: &OsString,
+) -> Result<Output, String> {
+    let mut cmd = Command::new(yt_dlp);
+    cmd.args(args).env("PATH", child_path);
+    apply_no_window(&mut cmd);
+
+    cmd.output()
+        .map_err(|err| format!("Failed to launch yt-dlp ('{}'): {err}", yt_dlp.display()))
+}
+
 fn run_yt_dlp_mp3(
     yt_dlp: &Path,
     ffmpeg_bin: &Path,
@@ -258,24 +385,48 @@ fn run_yt_dlp_mp3(
     child_path: &OsString,
 ) -> Result<Output, String> {
     let ffmpeg_loc = ffmpeg_bin.parent().unwrap_or(ffmpeg_bin);
-    let mut cmd = Command::new(yt_dlp);
-    cmd.args([
-        "--no-playlist",
-        "--no-progress",
-        "-x",
-        "--audio-format",
-        "mp3",
-        "--audio-quality",
-        "0",
-        "--ffmpeg-location",
-    ])
-    .arg(ffmpeg_loc)
-    .args(["-o", output_template, "--", url])
-    .env("PATH", child_path);
-    apply_no_window(&mut cmd);
+    run_yt_dlp_cmd(
+        yt_dlp,
+        &[
+            OsStr::new("--no-playlist"),
+            OsStr::new("--no-progress"),
+            OsStr::new("-x"),
+            OsStr::new("--audio-format"),
+            OsStr::new("mp3"),
+            OsStr::new("--audio-quality"),
+            OsStr::new("0"),
+            OsStr::new("--ffmpeg-location"),
+            ffmpeg_loc.as_os_str(),
+            OsStr::new("-o"),
+            OsStr::new(output_template),
+            OsStr::new("--"),
+            OsStr::new(url),
+        ],
+        child_path,
+    )
+}
 
-    cmd.output()
-        .map_err(|err| format!("Failed to launch yt-dlp ('{}'): {err}", yt_dlp.display()))
+#[cfg(target_os = "macos")]
+fn run_yt_dlp_m4a(
+    yt_dlp: &Path,
+    output_template: &str,
+    url: &str,
+    child_path: &OsString,
+) -> Result<Output, String> {
+    run_yt_dlp_cmd(
+        yt_dlp,
+        &[
+            OsStr::new("--no-playlist"),
+            OsStr::new("--no-progress"),
+            OsStr::new("-f"),
+            OsStr::new("bestaudio[ext=m4a]/bestaudio"),
+            OsStr::new("-o"),
+            OsStr::new(output_template),
+            OsStr::new("--"),
+            OsStr::new(url),
+        ],
+        child_path,
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -496,37 +647,39 @@ fn ensure_yt_dlp_binary(on_progress: &dyn Fn(String)) -> Result<PathBuf, String>
     Ok(final_path)
 }
 
-fn platform_ffmpeg_download_spec() -> Option<(
+#[cfg(target_os = "windows")]
+fn windows_ffmpeg_download_spec() -> (
     &'static [&'static str],
     &'static [&'static str],
     &'static str,
-)> {
-    #[cfg(target_os = "windows")]
-    {
-        Some((
-            &["https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"],
-            &["ffmpeg.exe", "ffprobe.exe"],
-            "ffmpeg.exe",
-        ))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Some((
-            &[
-                "https://evermeet.cx/ffmpeg/getrelease/zip",
-                "https://evermeet.cx/ffmpeg/get/zip",
-            ],
-            &["ffmpeg"],
-            "ffmpeg",
-        ))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        None
+) {
+    (
+        &["https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"],
+        &["ffmpeg.exe", "ffprobe.exe"],
+        "ffmpeg.exe",
+    )
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_ffmpeg_download_urls_for_arch(arch: &str) -> &'static [&'static str] {
+    match arch {
+        "aarch64" => &[
+            "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-arm64",
+            "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/darwin-arm64",
+            "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-arm64.gz",
+            "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/darwin-arm64.gz",
+        ],
+        _ => &[
+            "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-x64",
+            "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/darwin-x64",
+            "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-x64.gz",
+            "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/darwin-x64.gz",
+        ],
     }
 }
 
 /// Extracts matching binary filenames from a `.zip` archive into `bin_dir`, returning the primary binary path.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn extract_binaries_from_zip<R: Read + Seek>(
     reader: R,
     bin_dir: &Path,
@@ -596,62 +749,49 @@ fn extract_binaries_from_zip<R: Read + Seek>(
     }
 }
 
-/// Locates `ffmpeg` in `WaweFX/bin/` or system `PATH`, or downloads and extracts a standalone static build into `WaweFX/bin/`.
-fn ensure_ffmpeg_binary(on_progress: &dyn Fn(String)) -> Result<PathBuf, String> {
-    if let Some(existing) = resolve_ffmpeg_binary() {
-        return Ok(existing);
+fn verify_ffmpeg_runs(ffmpeg_path: &Path) -> bool {
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.arg("-version").stdin(Stdio::null());
+    apply_no_window(&mut cmd);
+    matches!(cmd.output(), Ok(out) if out.status.success())
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn download_to_path(agent: &ureq::Agent, url: &str, dest_path: &Path) -> Result<(), String> {
+    let _ = fs::remove_file(dest_path);
+    match agent.get(url).set("User-Agent", "WaweFX").call() {
+        Ok(response) if response.status() == 200 => {
+            let copy_res = (|| -> io::Result<()> {
+                let mut reader = response.into_reader();
+                let mut out_file = File::create(dest_path)?;
+                io::copy(&mut reader, &mut out_file)?;
+                out_file.sync_all()?;
+                Ok(())
+            })();
+            copy_res.map_err(|err| format!("failed writing download: {err}"))
+        }
+        Ok(response) => Err(format!("HTTP {}", response.status())),
+        Err(err) => Err(err.to_string()),
     }
+}
 
-    let Some((urls, target_names, primary_name)) = platform_ffmpeg_download_spec() else {
-        return Err(
-            "ffmpeg was not found in WaweFX/bin/ or PATH. Please install ffmpeg via your package manager."
-                .to_string(),
-        );
-    };
-
-    let bin_dir = AppConfig::bin_dir();
-    fs::create_dir_all(&bin_dir)
-        .map_err(|err| format!("Failed to create '{}': {err}", bin_dir.display()))?;
-
-    on_progress("Downloading yt-dlp & ffmpeg (first-time setup)...".to_string());
-
+#[cfg(target_os = "windows")]
+fn download_windows_ffmpeg_binary(
+    bin_dir: &Path,
+    agent: &ureq::Agent,
+) -> Result<PathBuf, String> {
+    let (urls, target_names, primary_name) = windows_ffmpeg_download_spec();
     let zip_tmp = bin_dir.join("ffmpeg_download.zip.part");
-    let _ = fs::remove_file(&zip_tmp);
-
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(FFMPEG_TIMEOUT_SECS))
-        .build();
-
     let mut last_err = String::from("no download URLs configured");
     let mut downloaded_ok = false;
 
     for &url in urls {
-        let _ = fs::remove_file(&zip_tmp);
-        match agent.get(url).set("User-Agent", "WaweFX").call() {
-            Ok(response) if response.status() == 200 => {
-                let copy_res = (|| -> io::Result<()> {
-                    let mut reader = response.into_reader();
-                    let mut out_file = File::create(&zip_tmp)?;
-                    io::copy(&mut reader, &mut out_file)?;
-                    out_file.sync_all()?;
-                    Ok(())
-                })();
-                match copy_res {
-                    Ok(()) => {
-                        downloaded_ok = true;
-                        break;
-                    }
-                    Err(err) => {
-                        last_err = format!("failed writing archive: {err}");
-                    }
-                }
+        match download_to_path(agent, url, &zip_tmp) {
+            Ok(()) => {
+                downloaded_ok = true;
+                break;
             }
-            Ok(response) => {
-                last_err = format!("HTTP {}", response.status());
-            }
-            Err(err) => {
-                last_err = err.to_string();
-            }
+            Err(err) => last_err = err,
         }
     }
 
@@ -665,11 +805,155 @@ fn ensure_ffmpeg_binary(on_progress: &dyn Fn(String)) -> Result<PathBuf, String>
     let extract_res = (|| -> Result<PathBuf, String> {
         let file = File::open(&zip_tmp)
             .map_err(|err| format!("Failed to open downloaded ffmpeg zip: {err}"))?;
-        extract_binaries_from_zip(BufReader::new(file), &bin_dir, target_names, primary_name)
+        extract_binaries_from_zip(
+            io::BufReader::new(file),
+            bin_dir,
+            target_names,
+            primary_name,
+        )
     })();
 
     let _ = fs::remove_file(&zip_tmp);
-    extract_res
+    let primary_path = extract_res?;
+    if !verify_ffmpeg_runs(&primary_path) {
+        let _ = fs::remove_file(&primary_path);
+        return Err("Downloaded ffmpeg binary failed verification (-version).".to_string());
+    }
+    Ok(primary_path)
+}
+
+#[cfg(target_os = "macos")]
+fn maybe_decompress_gzip_file(part_path: &Path) -> Result<(), String> {
+    let mut magic = [0u8; 2];
+    let is_gzip = File::open(part_path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && magic == [0x1f, 0x8b];
+    if !is_gzip {
+        return Ok(());
+    }
+
+    let gz_path = part_path.with_extension("part.gz");
+    let _ = fs::remove_file(&gz_path);
+    fs::rename(part_path, &gz_path)
+        .map_err(|err| format!("Failed staging gzipped ffmpeg: {err}"))?;
+
+    let out = Command::new("/usr/bin/gzip")
+        .args(["-df"])
+        .arg(&gz_path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| {
+            let _ = fs::remove_file(&gz_path);
+            format!("Failed to run /usr/bin/gzip: {err}")
+        })?;
+
+    if !out.status.success() || !part_path.is_file() {
+        let _ = fs::remove_file(&gz_path);
+        let _ = fs::remove_file(part_path);
+        return Err("Failed decompressing downloaded gzipped ffmpeg.".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn download_macos_ffmpeg_binary(
+    bin_dir: &Path,
+    agent: &ureq::Agent,
+) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let urls = macos_ffmpeg_download_urls_for_arch(std::env::consts::ARCH);
+    let part_path = bin_dir.join("ffmpeg.part");
+    let final_path = bin_dir.join("ffmpeg");
+    let mut last_err = String::from("no download URLs configured");
+
+    for &url in urls {
+        if let Err(err) = download_to_path(agent, url, &part_path) {
+            let _ = fs::remove_file(&part_path);
+            last_err = err;
+            continue;
+        }
+
+        if let Err(err) = maybe_decompress_gzip_file(&part_path) {
+            last_err = err;
+            continue;
+        }
+
+        let file_len = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+        if file_len < 1_000_000 {
+            let _ = fs::remove_file(&part_path);
+            last_err = format!("downloaded file too small ({file_len} bytes)");
+            continue;
+        }
+
+        if let Err(err) = fs::set_permissions(&part_path, fs::Permissions::from_mode(0o755)) {
+            let _ = fs::remove_file(&part_path);
+            last_err = format!("failed setting executable permissions: {err}");
+            continue;
+        }
+
+        let _ = fs::remove_file(&final_path);
+        if let Err(err) = fs::rename(&part_path, &final_path) {
+            let _ = fs::remove_file(&part_path);
+            last_err = format!("failed finalizing ffmpeg binary: {err}");
+            continue;
+        }
+
+        if verify_ffmpeg_runs(&final_path) {
+            return Ok(final_path);
+        }
+
+        let _ = fs::remove_file(&final_path);
+        last_err = "downloaded ffmpeg failed -version verification".to_string();
+    }
+
+    Err(format!(
+        "ffmpeg was not found and automatic macOS download failed ({last_err})."
+    ))
+}
+
+/// Locates `ffmpeg` in `WaweFX/bin/` or system `PATH`, or downloads a standalone static build into `WaweFX/bin/`.
+fn ensure_ffmpeg_binary(on_progress: &dyn Fn(String)) -> Result<PathBuf, String> {
+    if let Some(existing) = resolve_ffmpeg_binary() {
+        if verify_ffmpeg_runs(&existing) {
+            return Ok(existing);
+        }
+        if existing.starts_with(AppConfig::bin_dir()) {
+            let _ = fs::remove_file(&existing);
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = on_progress;
+        return Err(
+            "ffmpeg was not found in WaweFX/bin/ or PATH. Please install ffmpeg via your package manager."
+                .to_string(),
+        );
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let bin_dir = AppConfig::bin_dir();
+        fs::create_dir_all(&bin_dir)
+            .map_err(|err| format!("Failed to create '{}': {err}", bin_dir.display()))?;
+
+        on_progress("Downloading yt-dlp & ffmpeg (first-time setup)...".to_string());
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(FFMPEG_TIMEOUT_SECS))
+            .build();
+
+        #[cfg(target_os = "windows")]
+        {
+            download_windows_ffmpeg_binary(&bin_dir, &agent)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            download_macos_ffmpeg_binary(&bin_dir, &agent)
+        }
+    }
 }
 
 /// Strips a trailing ` [<youtube_id>]` suffix from a downloaded filename stem.
@@ -730,8 +1014,8 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use super::{
-        clean_title_from_stem, extract_binaries_from_zip, resolve_binary_in_dirs,
-        validate_youtube_url,
+        build_afconvert_wav_path, clean_title_from_stem, extract_binaries_from_zip,
+        macos_ffmpeg_download_urls_for_arch, resolve_binary_in_dirs, validate_youtube_url,
     };
 
     #[test]
@@ -856,5 +1140,35 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&bin_dir);
+    }
+
+    #[test]
+    fn selects_arch_specific_macos_ffmpeg_github_urls() {
+        let arm64 = macos_ffmpeg_download_urls_for_arch("aarch64");
+        assert!(arm64.contains(
+            &"https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-arm64"
+        ));
+        assert!(arm64.contains(
+            &"https://github.com/eugeneware/ffmpeg-static/releases/latest/download/darwin-arm64"
+        ));
+        assert!(!arm64.iter().any(|u| u.contains("evermeet.cx")));
+
+        let x64 = macos_ffmpeg_download_urls_for_arch("x86_64");
+        assert!(x64.contains(
+            &"https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-darwin-x64"
+        ));
+        assert!(x64.contains(
+            &"https://github.com/eugeneware/ffmpeg-static/releases/latest/download/darwin-x64"
+        ));
+        assert!(!x64.iter().any(|u| u.contains("evermeet.cx")));
+    }
+
+    #[test]
+    fn builds_afconvert_wav_output_path() {
+        let m4a = PathBuf::from("/tmp/stage/Mr. Brightside [dQw4w9WgXcQ].m4a");
+        assert_eq!(
+            build_afconvert_wav_path(&m4a),
+            PathBuf::from("/tmp/stage/Mr. Brightside [dQw4w9WgXcQ].wav")
+        );
     }
 }
