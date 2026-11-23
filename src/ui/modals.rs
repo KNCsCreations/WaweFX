@@ -451,7 +451,7 @@ fn poll_youtube_download(draft: &mut SoundModalDraft, config: &AppConfig) {
         draft.youtube_status = None;
         if draft.error_message.is_none() {
             draft.error_message =
-                Some("YouTube download worker terminated unexpectedly.".to_string());
+                Some("Audio import worker terminated unexpectedly.".to_string());
         }
         finished = true;
     }
@@ -484,6 +484,26 @@ fn start_youtube_download(ctx: &egui::Context, draft: &mut SoundModalDraft, audi
     }
 }
 
+pub(crate) fn start_video_audio_extraction(
+    ctx: &egui::Context,
+    draft: &mut SoundModalDraft,
+    audio: &AudioEngine,
+    video_path: PathBuf,
+) {
+    if draft.youtube_downloading {
+        return;
+    }
+    draft.youtube_downloading = true;
+    draft.youtube_status = Some("Extracting audio from video...".to_string());
+    draft.error_message = None;
+    let rx = yt_downloader::spawn_video_audio_extraction(
+        video_path,
+        audio.clone(),
+        ctx.clone(),
+    );
+    draft.youtube_rx = Some(Arc::new(Mutex::new(rx)));
+}
+
 fn render_sound_editor_modal(
     ctx: &egui::Context,
     draft: &mut SoundModalDraft,
@@ -492,9 +512,7 @@ fn render_sound_editor_modal(
     outcome: &mut ModalOutcome,
 ) {
     let is_new = draft.editing_id.is_none();
-    if is_new {
-        poll_youtube_download(draft, config);
-    }
+    poll_youtube_download(draft, config);
 
     if draft.audio_path.as_ref() != draft.waveform_loaded_for.as_ref() {
         if let Some(ref path) = draft.audio_path {
@@ -551,32 +569,42 @@ fn render_sound_editor_modal(
                             .add_enabled(!draft.youtube_downloading, egui::Button::new("Browse Audio..."))
                             .clicked()
                             && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Audio Files", &["mp3", "wav", "ogg", "flac"])
+                                .add_filter(
+                                    "Audio & Video Files",
+                                    &[
+                                        "mp3", "wav", "ogg", "flac", "mp4", "mov", "mkv", "webm",
+                                        "avi",
+                                    ],
+                                )
                                 .pick_file()
                         {
-                            if draft.title.trim().is_empty()
-                                && let Some(stem) = path.file_stem()
-                            {
-                                draft.title = stem.to_string_lossy().to_string();
-                            }
-                            match audio.probe_audio_with_peaks(&path) {
-                                Ok((secs, peaks)) => {
-                                    if let Some(prev_audio) = draft.audio_path.take()
-                                        && prev_audio != path
-                                    {
-                                        config.cleanup_managed_path(&prev_audio);
-                                    }
-                                    draft.duration_secs = secs;
-                                    draft.trim_start = 0.0;
-                                    draft.trim_end = 1.0;
-                                    draft.waveform_peaks = Some(peaks);
-                                    draft.waveform_loaded_for = Some(path.clone());
-                                    draft.audio_path = Some(path);
-                                    draft.error_message = None;
+                            if yt_downloader::is_video_file(&path) {
+                                start_video_audio_extraction(ctx, draft, audio, path);
+                            } else {
+                                if draft.title.trim().is_empty()
+                                    && let Some(stem) = path.file_stem()
+                                {
+                                    draft.title = stem.to_string_lossy().to_string();
                                 }
-                                Err(err) => {
-                                    draft.error_message =
-                                        Some(format!("Could not decode audio: {err}"));
+                                match audio.probe_audio_with_peaks(&path) {
+                                    Ok((secs, peaks)) => {
+                                        if let Some(prev_audio) = draft.audio_path.take()
+                                            && prev_audio != path
+                                        {
+                                            config.cleanup_managed_path(&prev_audio);
+                                        }
+                                        draft.duration_secs = secs;
+                                        draft.trim_start = 0.0;
+                                        draft.trim_end = 1.0;
+                                        draft.waveform_peaks = Some(peaks);
+                                        draft.waveform_loaded_for = Some(path.clone());
+                                        draft.audio_path = Some(path);
+                                        draft.error_message = None;
+                                    }
+                                    Err(err) => {
+                                        draft.error_message =
+                                            Some(format!("Could not decode audio: {err}"));
+                                    }
                                 }
                             }
                         }
@@ -609,19 +637,19 @@ fn render_sound_editor_modal(
                             start_youtube_download(ctx, draft, audio);
                         }
                         ui.end_row();
+                    }
 
-                        if draft.youtube_downloading {
-                            ui.label("");
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                let status = draft
-                                    .youtube_status
-                                    .as_deref()
-                                    .unwrap_or("Downloading & converting audio...");
-                                ui.label(egui::RichText::new(status).weak().size(11.5));
-                            });
-                            ui.end_row();
-                        }
+                    if draft.youtube_downloading {
+                        ui.label("");
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            let status = draft
+                                .youtube_status
+                                .as_deref()
+                                .unwrap_or("Extracting audio...");
+                            ui.label(egui::RichText::new(status).weak().size(11.5));
+                        });
+                        ui.end_row();
                     }
 
                     ui.label("Cover Image:");

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,7 @@ const FALLBACK_GIF_DELAY: Duration = Duration::from_millis(50);
 /// Embedded WaweFX brand logo PNG bytes compiled directly into the standalone binary.
 pub const LOGO_PNG_BYTES: &[u8] = include_bytes!("../../assets/logo.png");
 
+use crate::audio::yt_downloader::{self, YoutubeDownloadEvent};
 use crate::audio::{AudioDeviceList, AudioEngine, PREVIEW_SOUND_ID};
 use crate::config::{
     AppConfig, ShortcutOwner, SoundItem, rgb_to_color32, sanitize_trim_range, step_playback_speed,
@@ -395,8 +396,15 @@ pub struct WaweFxApp {
     last_hovered_image_pad_id: Option<String>,
     last_valid_pointer_pos: Option<egui::Pos2>,
     pending_cover_drop: Option<PendingCoverDrop>,
+    pending_video_drops: Vec<PendingVideoDrop>,
     status_toast: Option<(String, Instant)>,
     last_playback_state: (bool, Option<String>),
+}
+
+struct PendingVideoDrop {
+    source_name: String,
+    status: String,
+    rx: Receiver<YoutubeDownloadEvent>,
 }
 
 impl WaweFxApp {
@@ -429,9 +437,75 @@ impl WaweFxApp {
             last_hovered_image_pad_id: None,
             last_valid_pointer_pos: None,
             pending_cover_drop: None,
+            pending_video_drops: Vec::new(),
             status_toast: None,
             last_playback_state,
         }
+    }
+
+    fn poll_pending_video_drops(&mut self) -> bool {
+        if self.pending_video_drops.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        let mut remaining = Vec::with_capacity(self.pending_video_drops.len());
+        let jobs = std::mem::take(&mut self.pending_video_drops);
+
+        for mut job in jobs {
+            let mut done = false;
+            loop {
+                match job.rx.try_recv() {
+                    Ok(YoutubeDownloadEvent::Progress(msg)) => {
+                        job.status = msg;
+                    }
+                    Ok(YoutubeDownloadEvent::Completed {
+                        audio_path,
+                        clean_title,
+                        duration_secs,
+                        ..
+                    }) => {
+                        let item = SoundItem::new(
+                            clean_title.clone(),
+                            audio_path,
+                            None,
+                            duration_secs,
+                        );
+                        self.config.selected_sound_id = Some(item.id.clone());
+                        self.config.sounds.push(item);
+                        self.last_error = None;
+                        self.status_toast = Some((
+                            format!("Added '{clean_title}' from video"),
+                            Instant::now(),
+                        ));
+                        changed = true;
+                        done = true;
+                        break;
+                    }
+                    Ok(YoutubeDownloadEvent::Failed(err)) => {
+                        self.last_error = Some(err);
+                        done = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.last_error = Some(format!(
+                            "Video audio extraction for '{}' terminated unexpectedly.",
+                            job.source_name
+                        ));
+                        done = true;
+                        break;
+                    }
+                }
+            }
+
+            if !done {
+                remaining.push(job);
+            }
+        }
+
+        self.pending_video_drops = remaining;
+        changed
     }
 
     fn set_target_pitch(&mut self, next_speed: f32) {
@@ -612,6 +686,11 @@ impl eframe::App for WaweFxApp {
         let mut config_dirty = false;
         let mut sync_dirty = false;
 
+        if self.poll_pending_video_drops() {
+            config_dirty = true;
+            sync_dirty = true;
+        }
+
         self.hotkeys.sync_bindings(&self.config);
         for hk_action in self.hotkeys.poll_triggered() {
             match hk_action {
@@ -781,7 +860,11 @@ impl eframe::App for WaweFxApp {
         let accent = rgb_to_color32(self.config.theme.accent_color);
         let hovered_audio_drop = !is_any_modal_open
             && hovered_files.iter().any(|f| {
-                f.path.as_deref().is_some_and(is_audio_file) || f.mime.starts_with("audio/")
+                f.path
+                    .as_deref()
+                    .is_some_and(|p| is_audio_file(p) || yt_downloader::is_video_file(p))
+                    || f.mime.starts_with("audio/")
+                    || f.mime.starts_with("video/")
             });
         let hovered_image_drop = !is_any_modal_open
             && hovered_files.iter().any(|f| {
@@ -869,7 +952,7 @@ impl eframe::App for WaweFxApp {
                     "Drop image onto a sound pad (or open Edit Sound first)".to_string()
                 }
             } else if hovered_audio_drop && !hovered_image_drop {
-                "Drop audio file anywhere to add a new Sound Pad".to_string()
+                "Drop audio or video file anywhere to add a new Sound Pad".to_string()
             } else {
                 "Drop image onto a sound pad (or open Edit Sound first)".to_string()
             };
@@ -877,6 +960,24 @@ impl eframe::App for WaweFxApp {
                 ctx,
                 central_rect,
                 &hint,
+                accent,
+                rgb_to_color32(self.config.theme.bg_toolbar),
+                rgb_to_color32(self.config.theme.pad_text),
+            );
+        } else if let Some(active_video) = self.pending_video_drops.first() {
+            let text = if self.pending_video_drops.len() > 1 {
+                format!(
+                    "{} ({} remaining)",
+                    active_video.status,
+                    self.pending_video_drops.len()
+                )
+            } else {
+                active_video.status.clone()
+            };
+            paint_video_extract_spinner_pill(
+                ctx,
+                central_rect,
+                &text,
                 accent,
                 rgb_to_color32(self.config.theme.bg_toolbar),
                 rgb_to_color32(self.config.theme.pad_text),
@@ -939,7 +1040,7 @@ impl eframe::App for WaweFxApp {
             if let ActiveModal::SoundEditor(ref mut draft) = modal
                 && !dropped_files.is_empty()
             {
-                self.handle_dropped_files_in_modal(draft, &dropped_files);
+                self.handle_dropped_files_in_modal(ctx, draft, &dropped_files);
             }
 
             let bound_port = self.sync.bound_port();
@@ -1045,6 +1146,8 @@ impl eframe::App for WaweFxApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if self.audio.is_playing() {
             ctx.request_repaint_after(Duration::from_millis(33));
+        } else if !self.pending_video_drops.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
         } else if self.driver_setup.is_running() {
             ctx.request_repaint_after(Duration::from_millis(120));
         } else if self.status_toast.is_some() {
@@ -1100,6 +1203,7 @@ impl WaweFxApp {
 
     fn handle_dropped_files_in_modal(
         &mut self,
+        ctx: &egui::Context,
         draft: &mut SoundModalDraft,
         dropped_files: &[egui::DroppedFile],
     ) {
@@ -1128,6 +1232,13 @@ impl WaweFxApp {
                     }
                 }
             } else if let Some(ref path) = dropped.path
+                && !draft.youtube_downloading
+                && yt_downloader::is_video_file(path)
+            {
+                modals::start_video_audio_extraction(ctx, draft, &self.audio, path.clone());
+                return;
+            } else if let Some(ref path) = dropped.path
+                && !draft.youtube_downloading
                 && is_audio_file(path)
             {
                 if draft.title.trim().is_empty()
@@ -1137,6 +1248,11 @@ impl WaweFxApp {
                 }
                 match self.audio.probe_audio_with_peaks(path) {
                     Ok((secs, peaks)) => {
+                        if let Some(prev_audio) = draft.audio_path.take()
+                            && prev_audio != *path
+                        {
+                            self.config.cleanup_managed_path(&prev_audio);
+                        }
                         draft.duration_secs = secs;
                         draft.trim_start = 0.0;
                         draft.trim_end = 1.0;
@@ -1329,6 +1445,25 @@ impl WaweFxApp {
                         ));
                     }
                 }
+            } else if let Some(ref path) = dropped.path
+                && yt_downloader::is_video_file(path)
+            {
+                let source_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("video")
+                    .to_string();
+                let rx = yt_downloader::spawn_video_audio_extraction(
+                    path.clone(),
+                    self.audio.clone(),
+                    ctx.clone(),
+                );
+                self.pending_video_drops.push(PendingVideoDrop {
+                    source_name,
+                    status: "Extracting audio from video...".to_string(),
+                    rx,
+                });
+                self.last_error = None;
             } else if is_dropped_image(dropped) {
                 let (managed_cover, cover) = match import_and_decode_dropped_cover(dropped) {
                     Ok(res) => res,
@@ -1383,7 +1518,7 @@ impl WaweFxApp {
                 }
             } else if let Some(ref path) = dropped.path {
                 self.last_error = Some(format!(
-                    "Unsupported file type '{}'. Supported: mp3, wav, ogg, flac, png, jpg, jpeg, webp, bmp, gif.",
+                    "Unsupported file type '{}'. Supported: mp3, wav, ogg, flac, mp4, mov, mkv, webm, avi, png, jpg, jpeg, webp, bmp, gif.",
                     path.display()
                 ));
             } else {
@@ -1634,6 +1769,39 @@ fn paint_floating_hint_pill(
 ) {
     let center_y = (canvas_rect.max.y - 24.0).max(canvas_rect.min.y + 20.0);
     paint_pill_at_y(ctx, canvas_rect, center_y, "wawefx_drop_hint_pill", text, accent, surface, text_color);
+}
+
+fn paint_video_extract_spinner_pill(
+    ctx: &egui::Context,
+    canvas_rect: egui::Rect,
+    text: &str,
+    accent: egui::Color32,
+    surface: egui::Color32,
+    text_color: egui::Color32,
+) {
+    let anchor_pos = egui::pos2(
+        canvas_rect.center().x,
+        (canvas_rect.max.y - 10.0).max(canvas_rect.min.y + 40.0),
+    );
+    let bg = egui::Color32::from_rgba_unmultiplied(surface.r(), surface.g(), surface.b(), 240);
+    egui::Area::new(egui::Id::new("wawefx_video_extract_spinner_pill"))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::CENTER_BOTTOM)
+        .fixed_pos(anchor_pos)
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::NONE
+                .fill(bg)
+                .stroke(egui::Stroke::new(1.5_f32, accent))
+                .corner_radius(egui::CornerRadius::same(15))
+                .inner_margin(egui::Margin::symmetric(12, 6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new(text).color(text_color).size(12.5));
+                    });
+                });
+        });
 }
 
 #[allow(clippy::too_many_arguments)]

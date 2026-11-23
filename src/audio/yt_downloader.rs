@@ -129,41 +129,74 @@ pub fn validate_youtube_url(raw: &str) -> Result<String, String> {
     Err("Please enter a valid YouTube or Shorts URL (youtube.com or youtu.be).".to_string())
 }
 
-/// Starts a background YouTube audio download + waveform decode worker thread.
-pub fn spawn_youtube_download(
-    url: String,
-    audio: AudioEngine,
+/// Video file extensions accepted for automatic audio-track extraction.
+pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi"];
+
+/// Returns `true` if `path` has a supported video container extension.
+pub fn is_video_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            let lower = ext.to_ascii_lowercase();
+            VIDEO_EXTENSIONS.contains(&lower.as_str())
+        })
+}
+
+fn spawn_audio_import_worker<F>(
+    thread_name: &str,
     ctx: egui::Context,
-) -> Receiver<YoutubeDownloadEvent> {
+    work: F,
+) -> Receiver<YoutubeDownloadEvent>
+where
+    F: FnOnce(&dyn Fn(String)) -> Result<YoutubeDownloadEvent, String> + Send + 'static,
+{
     let (tx, rx) = mpsc::channel();
 
     let spawn_res = thread::Builder::new()
-        .name("wawefx-yt-download".to_string())
+        .name(thread_name.to_string())
         .spawn(move || {
             let emit = |ev: YoutubeDownloadEvent| {
                 let _ = tx.send(ev);
                 ctx.request_repaint();
             };
 
-            match download_youtube_audio_sync(&url, &audio, &|msg| {
-                emit(YoutubeDownloadEvent::Progress(msg));
-            }) {
+            match work(&|msg| emit(YoutubeDownloadEvent::Progress(msg))) {
                 Ok(completed) => emit(completed),
                 Err(err) => emit(YoutubeDownloadEvent::Failed(err)),
             }
         });
 
     if let Err(err) = spawn_res {
-        // Channel was already closed on drop only if spawn failed; callers will treat Disconnected
-        // cleanly, or we could avoid panic by returning a receiver that reads from a fallback sender.
         let (err_tx, err_rx) = mpsc::channel();
         let _ = err_tx.send(YoutubeDownloadEvent::Failed(format!(
-            "Could not start download worker thread: {err}"
+            "Could not start audio import worker thread: {err}"
         )));
         return err_rx;
     }
 
     rx
+}
+
+/// Starts a background YouTube audio download + waveform decode worker thread.
+pub fn spawn_youtube_download(
+    url: String,
+    audio: AudioEngine,
+    ctx: egui::Context,
+) -> Receiver<YoutubeDownloadEvent> {
+    spawn_audio_import_worker("wawefx-yt-download", ctx, move |on_progress| {
+        download_youtube_audio_sync(&url, &audio, on_progress)
+    })
+}
+
+/// Starts a background video audio-track extraction + waveform decode worker thread.
+pub fn spawn_video_audio_extraction(
+    video_path: PathBuf,
+    audio: AudioEngine,
+    ctx: egui::Context,
+) -> Receiver<YoutubeDownloadEvent> {
+    spawn_audio_import_worker("wawefx-video-extract", ctx, move |on_progress| {
+        extract_video_audio_sync(&video_path, &audio, on_progress)
+    })
 }
 
 fn download_youtube_audio_sync(
@@ -234,6 +267,16 @@ fn download_youtube_audio_sync(
     })?;
     clear_dir_files(&stage_dir);
 
+    probe_extracted_audio(audio, rel_path, &final_path, clean_title, on_progress)
+}
+
+fn probe_extracted_audio(
+    audio: &AudioEngine,
+    rel_path: PathBuf,
+    final_path: &Path,
+    clean_title: String,
+    on_progress: &dyn Fn(String),
+) -> Result<YoutubeDownloadEvent, String> {
     on_progress("Analyzing waveform & duration...".to_string());
     match audio.probe_audio_with_peaks(&rel_path) {
         Ok((duration_secs, waveform_peaks)) => Ok(YoutubeDownloadEvent::Completed {
@@ -243,10 +286,164 @@ fn download_youtube_audio_sync(
             waveform_peaks,
         }),
         Err(err) => {
-            let _ = fs::remove_file(&final_path);
-            Err(format!("Downloaded audio could not be decoded: {err:#}"))
+            let _ = fs::remove_file(final_path);
+            Err(format!("Extracted audio could not be decoded: {err:#}"))
         }
     }
+}
+
+fn build_ffmpeg_extract_mp3_args(input_video: &Path, output_mp3: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("-y"),
+        OsString::from("-i"),
+        input_video.as_os_str().to_os_string(),
+        OsString::from("-vn"),
+        OsString::from("-acodec"),
+        OsString::from("libmp3lame"),
+        OsString::from("-q:a"),
+        OsString::from("2"),
+        output_mp3.as_os_str().to_os_string(),
+    ]
+}
+
+fn run_ffmpeg_extract_mp3(
+    ffmpeg_bin: &Path,
+    input_video: &Path,
+    output_mp3: &Path,
+    child_path: &OsString,
+) -> Result<Output, String> {
+    let mut cmd = Command::new(ffmpeg_bin);
+    cmd.args(build_ffmpeg_extract_mp3_args(input_video, output_mp3))
+        .stdin(Stdio::null())
+        .env("PATH", child_path);
+    apply_no_window(&mut cmd);
+
+    cmd.output()
+        .map_err(|err| format!("Failed to launch ffmpeg ('{}'): {err}", ffmpeg_bin.display()))
+}
+
+fn format_process_stderr(output: &Output, tool_name: &str) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last_non_empty = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty());
+    match last_non_empty {
+        Some(line) => format!("{tool_name} failed: {line}"),
+        None => format!(
+            "{tool_name} failed with exit code {:?}",
+            output.status.code()
+        ),
+    }
+}
+
+fn extract_video_audio_sync(
+    video_path: &Path,
+    audio: &AudioEngine,
+    on_progress: &dyn Fn(String),
+) -> Result<YoutubeDownloadEvent, String> {
+    if !video_path.is_file() {
+        return Err(format!("Video file '{}' was not found.", video_path.display()));
+    }
+
+    AppConfig::ensure_data_dirs().map_err(|err| format!("Failed to prepare storage: {err:#}"))?;
+
+    let raw_stem = video_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Video Sound");
+    let clean_title = raw_stem.to_string();
+    let sanitized_base = {
+        let s = sanitize_filename_stem(&clean_title);
+        if s.is_empty() {
+            "video_sound".to_string()
+        } else {
+            s
+        }
+    };
+    let short_id = Uuid::new_v4().simple().to_string();
+    let short_id = &short_id[..8];
+    let sounds_dir = AppConfig::sounds_dir();
+
+    if resolve_ffmpeg_binary().is_none() {
+        on_progress("Downloading ffmpeg (first-time setup)...".to_string());
+    }
+
+    let (rel_path, final_path) = stage_video_audio(
+        video_path,
+        &sounds_dir,
+        &sanitized_base,
+        short_id,
+        on_progress,
+    )?;
+
+    probe_extracted_audio(audio, rel_path, &final_path, clean_title, on_progress)
+}
+
+fn try_extract_video_with_ffmpeg(
+    video_path: &Path,
+    sounds_dir: &Path,
+    sanitized_base: &str,
+    short_id: &str,
+    on_progress: &dyn Fn(String),
+) -> Result<(PathBuf, PathBuf), String> {
+    let ffmpeg_bin = ensure_ffmpeg_binary(on_progress)?;
+    let final_filename = format!("{sanitized_base}_{short_id}.mp3");
+    let rel_path = PathBuf::from(SOUNDS_SUBDIR).join(&final_filename);
+    let final_path = sounds_dir.join(&final_filename);
+    let child_path = build_augmented_path(&AppConfig::bin_dir());
+
+    on_progress("Extracting audio from video...".to_string());
+    let out = run_ffmpeg_extract_mp3(&ffmpeg_bin, video_path, &final_path, &child_path)?;
+    if !out.status.success()
+        || !final_path.is_file()
+        || fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0) == 0
+    {
+        let _ = fs::remove_file(&final_path);
+        return Err(format_process_stderr(&out, "ffmpeg"));
+    }
+
+    Ok((rel_path, final_path))
+}
+
+#[cfg(target_os = "macos")]
+fn stage_video_audio(
+    video_path: &Path,
+    sounds_dir: &Path,
+    sanitized_base: &str,
+    short_id: &str,
+    on_progress: &dyn Fn(String),
+) -> Result<(PathBuf, PathBuf), String> {
+    if let Ok(paths) = try_extract_video_with_ffmpeg(
+        video_path,
+        sounds_dir,
+        sanitized_base,
+        short_id,
+        on_progress,
+    ) {
+        return Ok(paths);
+    }
+
+    on_progress("Extracting audio via macOS afconvert...".to_string());
+    let final_filename = format!("{sanitized_base}_{short_id}.wav");
+    let rel_path = PathBuf::from(SOUNDS_SUBDIR).join(&final_filename);
+    let final_path = sounds_dir.join(&final_filename);
+    run_afconvert_to_wav(video_path, &final_path)?;
+    Ok((rel_path, final_path))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stage_video_audio(
+    video_path: &Path,
+    sounds_dir: &Path,
+    sanitized_base: &str,
+    short_id: &str,
+    on_progress: &dyn Fn(String),
+) -> Result<(PathBuf, PathBuf), String> {
+    try_extract_video_with_ffmpeg(video_path, sounds_dir, sanitized_base, short_id, on_progress)
 }
 
 #[cfg(target_os = "macos")]
@@ -309,6 +506,26 @@ fn build_afconvert_wav_path(input_path: &Path) -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
+fn run_afconvert_to_wav(input_path: &Path, wav_path: &Path) -> Result<(), String> {
+    let _ = fs::remove_file(wav_path);
+
+    let out = Command::new("/usr/bin/afconvert")
+        .args(["-f", "WAVE", "-d", "LEI16"])
+        .arg(input_path)
+        .arg(wav_path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("Failed to run /usr/bin/afconvert: {err}"))?;
+
+    if !out.status.success() || !wav_path.is_file() {
+        let _ = fs::remove_file(wav_path);
+        return Err(format_process_stderr(&out, "macOS afconvert"));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn convert_audio_with_afconvert(input_path: &Path) -> Result<PathBuf, String> {
     if input_path
         .extension()
@@ -319,27 +536,7 @@ fn convert_audio_with_afconvert(input_path: &Path) -> Result<PathBuf, String> {
     }
 
     let wav_path = build_afconvert_wav_path(input_path);
-    let _ = fs::remove_file(&wav_path);
-
-    let out = Command::new("/usr/bin/afconvert")
-        .args(["-f", "WAVE", "-d", "LEI16"])
-        .arg(input_path)
-        .arg(&wav_path)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|err| format!("Failed to run /usr/bin/afconvert: {err}"))?;
-
-    if !out.status.success() || !wav_path.is_file() {
-        let _ = fs::remove_file(&wav_path);
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let detail = if stderr.is_empty() {
-            format!("exit code {:?}", out.status.code())
-        } else {
-            stderr
-        };
-        return Err(format!("macOS afconvert failed: {detail}"));
-    }
-
+    run_afconvert_to_wav(input_path, &wav_path)?;
     let _ = fs::remove_file(input_path);
     Ok(wav_path)
 }
@@ -1014,8 +1211,9 @@ mod tests {
     use zip::write::SimpleFileOptions;
 
     use super::{
-        build_afconvert_wav_path, clean_title_from_stem, extract_binaries_from_zip,
-        macos_ffmpeg_download_urls_for_arch, resolve_binary_in_dirs, validate_youtube_url,
+        build_afconvert_wav_path, build_ffmpeg_extract_mp3_args, clean_title_from_stem,
+        extract_binaries_from_zip, is_video_file, macos_ffmpeg_download_urls_for_arch,
+        resolve_binary_in_dirs, validate_youtube_url,
     };
 
     #[test]
@@ -1169,6 +1367,40 @@ mod tests {
         assert_eq!(
             build_afconvert_wav_path(&m4a),
             PathBuf::from("/tmp/stage/Mr. Brightside [dQw4w9WgXcQ].wav")
+        );
+    }
+
+    #[test]
+    fn detects_supported_video_extensions_case_insensitively() {
+        for ext in ["mp4", "MP4", "mov", "MOV", "mkv", "MKV", "webm", "WebM", "avi", "AVI"] {
+            assert!(is_video_file(std::path::Path::new(&format!("clip.{ext}"))));
+        }
+        assert!(!is_video_file(std::path::Path::new("sound.mp3")));
+        assert!(!is_video_file(std::path::Path::new("sound.wav")));
+        assert!(!is_video_file(std::path::Path::new("cover.png")));
+        assert!(!is_video_file(std::path::Path::new("no_ext")));
+    }
+
+    #[test]
+    fn builds_expected_ffmpeg_mp3_extraction_args() {
+        let args = build_ffmpeg_extract_mp3_args(
+            std::path::Path::new("C:/clips/intro.mp4"),
+            std::path::Path::new("C:/sounds/intro_1234abcd.mp3"),
+        );
+        let strs: Vec<_> = args.iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(
+            strs,
+            vec![
+                "-y",
+                "-i",
+                "C:/clips/intro.mp4",
+                "-vn",
+                "-acodec",
+                "libmp3lame",
+                "-q:a",
+                "2",
+                "C:/sounds/intro_1234abcd.mp3",
+            ]
         );
     }
 }
